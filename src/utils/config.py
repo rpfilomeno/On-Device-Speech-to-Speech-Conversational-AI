@@ -1,18 +1,7 @@
 from pathlib import Path
 import os
-import platform
 from dotenv import load_dotenv
 load_dotenv()
-
-def init_espeak():
-    """Initialize eSpeak environment variables. Must be called before any other imports."""
-    system = platform.system()
-    if system == "Windows":
-        os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
-        os.environ["PHONEMIZER_ESPEAK_PATH"] = r"C:\Program Files\eSpeak NG\espeak-ng.exe"
-
-
-init_espeak()
 
 from pydantic_settings import BaseSettings
 from pydantic import Field
@@ -28,13 +17,12 @@ class Settings(BaseSettings):
     OUTPUT_DIR: Path = BASE_DIR / "output"
     RECORDINGS_DIR: Path = BASE_DIR / "recordings"
 
-    ESPEAK_LIBRARY_PATH: str = r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
-    ESPEAK_PATH: str = r"C:\Program Files\eSpeak NG\espeak-ng.exe"
-
-    TTS_MODEL: str = Field(..., env="TTS_MODEL")
-    VOICE_NAME: str = Field(..., env="VOICE_NAME")
+    POCKET_TTS_URL: str = Field(
+        default="http://host.docker.internal:49112/", env="POCKET_TTS_URL"
+    )
+    POCKET_TTS_VOICE: str = Field(default="alba", env="POCKET_TTS_VOICE")
     SPEED: float = Field(default=1.0, env="SPEED")
-    HUGGINGFACE_TOKEN: str = Field(..., env="HUGGINGFACE_TOKEN")
+    HUGGINGFACE_TOKEN: Optional[str] = Field(default="", env="HUGGINGFACE_TOKEN")
 
     LM_STUDIO_URL: str = Field(..., env="LM_STUDIO_URL")
     OLLAMA_URL: str = Field(..., env="OLLAMA_URL")
@@ -79,6 +67,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 settings = Settings()

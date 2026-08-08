@@ -64,7 +64,7 @@ def process_input(
             session=session,
             messages=messages,
             llm_model=settings.LLM_MODEL,
-            llm_url=settings.OLLAMA_URL,
+            llm_url=settings.LM_STUDIO_URL,
             max_tokens=settings.MAX_TOKENS,
             stream=True,
         )
@@ -199,17 +199,15 @@ def main():
             print("\nInitializing Voice Activity Detection...")
             vad_pipeline = init_vad_pipeline(settings.HUGGINGFACE_TOKEN)
             print("\n=== Voice Chat Bot Initializing ===")
-            print("Device being used:", generator.device)
-            print("\nInitializing voice generator...")
-            result = generator.initialize(settings.TTS_MODEL, settings.VOICE_NAME)
+            print("\nInitializing voice generator (Pocket TTS remote streaming)...")
+            result = generator.initialize(
+                pocket_tts_url=settings.POCKET_TTS_URL,
+                pocket_tts_voice=settings.POCKET_TTS_VOICE,
+            )
             print(result)
             speed = settings.SPEED
             try:
-                print("\nWarming up the LLM model...")
-                health = session.get("http://localhost:11434", timeout=3)
-                if health.status_code != 200:
-                    print("Ollama not running! Start it first.")
-                    return
+                print("\nWarming up the LM Studio model...")
                 response_stream = get_ai_response(
                     session=session,
                     messages=[
@@ -217,7 +215,7 @@ def main():
                         {"role": "user", "content": "Hi!"},
                     ],
                     llm_model=settings.LLM_MODEL,
-                    llm_url=settings.OLLAMA_URL,
+                    llm_url=settings.LM_STUDIO_URL,
                     max_tokens=settings.MAX_TOKENS,
                     stream=False,
                 )

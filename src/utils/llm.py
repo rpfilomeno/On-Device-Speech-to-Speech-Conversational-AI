@@ -28,25 +28,26 @@ def warmup_llm(session: requests.Session, llm_model: str, llm_url: str):
         llm_url (str): The URL of the LLM server.
     """
     try:
-        health = session.get("http://localhost:11434", timeout=3)
-        if health.status_code != 200:
-            print("Ollama not running! Start it first.")
-            return
+        url = llm_url.rstrip("/")
+        if not url.endswith("/chat/completions"):
+            endpoint = f"{url}/chat/completions"
+        else:
+            endpoint = url
 
-        session.post(
-            llm_url,
+        res = session.post(
+            endpoint,
             json={
                 "model": llm_model,
-                "messages": [{"role": "user", "content": "."}],
-                "context": [],
-                "options": {"num_ctx": 64},
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 10,
+                "stream": False,
             },
             timeout=5,
         )
-
+        if res.status_code != 200:
+            print(f"LLM warmup status code: {res.status_code}")
     except requests.RequestException as e:
         print(f"Warmup failed: {str(e)}")
-        return
 
 
 def get_ai_response(
@@ -58,7 +59,7 @@ def get_ai_response(
     temperature: float = 0.7,
     stream: bool = False,
 ):
-    """Sends a request to the LLM and returns a streaming iterator.
+    """Sends a request to the LLM (LM Studio / OpenAI compatible API) and returns a streaming iterator.
 
     Args:
         session (requests.Session): The requests session to use.
@@ -73,15 +74,19 @@ def get_ai_response(
         iterator: An iterator over the streaming response.
     """
     try:
+        url = llm_url.rstrip("/")
+        if not url.endswith("/chat/completions"):
+            endpoint = f"{url}/chat/completions"
+        else:
+            endpoint = url
+
         response = session.post(
-            llm_url,
+            endpoint,
             json={
                 "model": llm_model,
                 "messages": messages,
-                "options": {
-                    "num_ctx": settings.MAX_TOKENS * 2,
-                    "num_thread": settings.NUM_THREADS,
-                },
+                "max_tokens": max_tokens,
+                "temperature": temperature,
                 "stream": stream,
             },
             timeout=3600,

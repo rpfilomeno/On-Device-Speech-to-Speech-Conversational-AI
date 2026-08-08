@@ -1,9 +1,7 @@
 keyboard
-phonemizer
 torch
 transformers
 scipy
-munch
 sounddevice
 python-multipart
 soundfile
