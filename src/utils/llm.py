@@ -6,7 +6,7 @@ from src.utils.config import settings
 
 
 def filter_response(response: str) -> str:
-    """Removes markdown formatting and unicode characters from a string.
+    """Removes markdown formatting, parenthetical text, and unicode characters from a string.
 
     Args:
         response (str): The string to filter.
@@ -15,6 +15,7 @@ def filter_response(response: str) -> str:
         str: The filtered string.
     """
     response = re.sub(r"\*\*|__|~~|`", "", response)
+    response = re.sub(r"\(.*?\)", "", response)
     response = re.sub(r"[\U00010000-\U0010ffff]", "", response, flags=re.UNICODE)
     return response
 

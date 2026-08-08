@@ -3,10 +3,7 @@ import threading
 import time
 from typing import Optional, Tuple, List
 import numpy as np
-from pathlib import Path
 import logging
-from datetime import datetime
-from .audio_io import save_audio_file
 
 logging.getLogger("phonemizer").setLevel(logging.ERROR)
 logging.getLogger("speechbrain.utils.quirks").setLevel(logging.ERROR)
@@ -15,23 +12,11 @@ logging.basicConfig(format="%(message)s", level=logging.INFO)
 
 class AudioGenerationQueue:
     """
-    A queue system for managing asynchronous audio generation from text input.
-
-    This class implements a threaded queue system that handles text-to-audio generation
-    in a background thread. It provides functionality for adding sentences to be processed,
-    retrieving generated audio, and monitoring the generation process.
-
-    Attributes:
-        generator: Audio generator instance used for text-to-speech conversion
-        speed (float): Speed multiplier for audio generation
-        output_dir (Path): Directory where generated audio files are saved
-        sentences_processed (int): Count of processed sentences
-        audio_generated (int): Count of successfully generated audio files
-        failed_sentences (list): List of tuples containing failed sentences and error messages
+    A queue system for managing asynchronous in-memory audio generation from text input.
     """
 
     def __init__(
-        self, generator, speed: float = 1.0, output_dir: Optional[Path] = None
+        self, generator, speed: float = 1.0
     ):
         """
         Initialize the audio generation queue system.
@@ -39,13 +24,10 @@ class AudioGenerationQueue:
         Args:
             generator: Audio generator instance for text-to-speech conversion
             speed: Speed multiplier for audio generation (default: 1.0)
-            output_dir: Directory path for saving generated audio files (default: "generated_audio")
         """
         self.generator = generator
         self.speed = speed
         self.lock = threading.Lock()
-        self.output_dir = output_dir or Path("generated_audio")
-        self.output_dir.mkdir(exist_ok=True)
         self.sentence_queue = Queue()
         self.audio_queue = Queue()
         self.is_running = False
@@ -102,18 +84,18 @@ class AudioGenerationQueue:
         if not self.is_running:
             self.start()
 
-    def get_next_audio(self) -> Tuple[Optional[np.ndarray], Optional[Path]]:
+    def get_next_audio(self) -> Tuple[Optional[np.ndarray], None]:
         """
         Retrieve the next generated audio segment from the queue.
 
         Returns:
             Tuple containing:
                 - numpy array of audio data (or None if queue is empty)
-                - Path object for the saved audio file (or None if queue is empty)
+                - None placeholder
         """
         try:
-            audio_data, output_path = self.audio_queue.get_nowait()
-            return audio_data, output_path
+            audio_data, _ = self.audio_queue.get_nowait()
+            return audio_data, None
         except:
             return None, None
 
@@ -122,28 +104,22 @@ class AudioGenerationQueue:
         Clear both sentence and audio queues, removing all pending items.
         Returns immediately without waiting for queue processing.
         """
-        sentences_cleared = 0
-        audio_cleared = 0
-
         while not self.sentence_queue.empty():
             try:
                 self.sentence_queue.get_nowait()
-                sentences_cleared += 1
             except:
                 pass
 
         while not self.audio_queue.empty():
             try:
                 self.audio_queue.get_nowait()
-                audio_cleared += 1
             except:
                 pass
 
     def _generation_worker(self):
         """
         Internal worker method that runs in a separate thread.
-        Continuously processes sentences from the queue, generating audio
-        and handling any errors that occur during generation.
+        Continuously processes sentences from the queue, generating in-memory audio buffers.
         """
         while self.is_running or not self.sentence_queue.empty():
             try:
@@ -157,17 +133,15 @@ class AudioGenerationQueue:
                     continue
 
                 try:
-                    audio_data, phonemes = self.generator.generate(
+                    audio_data, _ = self.generator.generate(
                         sentence, speed=self.speed
                     )
 
                     if audio_data is None or len(audio_data) == 0:
                         raise ValueError("Generated audio data is empty")
 
-                    output_path = save_audio_file(audio_data, self.output_dir)
                     self.audio_generated += 1
-
-                    self.audio_queue.put((audio_data, output_path))
+                    self.audio_queue.put((audio_data, None))
 
                 except Exception as e:
                     error_msg = str(e)

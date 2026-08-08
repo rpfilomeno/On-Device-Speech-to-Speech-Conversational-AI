@@ -184,7 +184,7 @@ def main():
     with requests.Session() as session:
         try:
             session = requests.Session()
-            generator = VoiceGenerator(settings.MODELS_DIR, settings.VOICES_DIR)
+            generator = VoiceGenerator()
             messages = [{"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT}]
 
             print("\n=== Text-to-Speech Chat Bot Initializing ===")

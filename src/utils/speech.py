@@ -28,7 +28,9 @@ def init_vad_pipeline(hf_token):
     from pyannote.audio import Model
     from pyannote.audio.pipelines import VoiceActivityDetection
 
-    model = Model.from_pretrained(settings.VAD_MODEL, use_auth_token=hf_token)
+    model = Model.from_pretrained(
+        settings.VAD_MODEL, use_auth_token=hf_token, local_files_only=True
+    )
 
     pipeline = VoiceActivityDetection(segmentation=model)
 
@@ -243,6 +245,7 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
 
         audio_level = np.abs(indata[:, 0]).mean()
         if audio_level > settings.INTERRUPTION_THRESHOLD:
+            print(f"\n[Interruption Detected] Audio Level: {audio_level:.4f} > {settings.INTERRUPTION_THRESHOLD}")
             interrupt_queue.put(True)
 
     def output_callback(outdata, frames, time, status):

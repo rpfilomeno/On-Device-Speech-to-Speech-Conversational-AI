@@ -78,9 +78,14 @@ def process_input(
         chunker = TextChunker()
         complete_response = []
 
-        playback_thread = threading.Thread(
-            target=lambda: audio_playback_worker(audio_queue)
-        )
+        playback_result = {"interrupted": False, "data": None}
+
+        def worker_runner():
+            was_int, int_data = audio_playback_worker(audio_queue)
+            playback_result["interrupted"] = was_int
+            playback_result["data"] = int_data
+
+        playback_thread = threading.Thread(target=worker_runner)
         playback_thread.daemon = True
         playback_thread.start()
 
@@ -121,7 +126,7 @@ def process_input(
 
         timing_info["end"] = time.perf_counter()
         print_timing_chart(timing_info)
-        return False, None
+        return playback_result["interrupted"], playback_result["data"]
 
     except Exception as e:
         print(f"\nError during streaming: {str(e)}")
@@ -149,6 +154,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, None]:
             if speech_detected:
                 was_interrupted = True
                 interrupt_audio = audio_data
+                audio_queue.clear_queues()
                 break
 
             audio_data, _ = audio_queue.get_next_audio()
@@ -159,6 +165,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, None]:
                 was_interrupted, interrupt_data = play_audio_with_interrupt(audio_data)
                 if was_interrupted:
                     interrupt_audio = interrupt_data
+                    audio_queue.clear_queues()
                     break
             else:
                 time.sleep(settings.PLAYBACK_DELAY)
@@ -181,12 +188,14 @@ def main():
     with requests.Session() as session:
         try:
             session = requests.Session()
-            generator = VoiceGenerator(settings.MODELS_DIR, settings.VOICES_DIR)
+            generator = VoiceGenerator()
             messages = [{"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT}]
             print("\nInitializing Whisper model...")
-            whisper_processor = WhisperProcessor.from_pretrained(settings.WHISPER_MODEL)
+            whisper_processor = WhisperProcessor.from_pretrained(
+                settings.WHISPER_MODEL, local_files_only=True
+            )
             whisper_model = WhisperForConditionalGeneration.from_pretrained(
-                settings.WHISPER_MODEL
+                settings.WHISPER_MODEL, local_files_only=True
             )
             print("\nInitializing Voice Activity Detection...")
             vad_pipeline = init_vad_pipeline(settings.HUGGINGFACE_TOKEN)
