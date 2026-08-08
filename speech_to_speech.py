@@ -116,16 +116,8 @@ def process_input(
         messages.append({"role": "assistant", "content": " ".join(complete_response)})
         print()
 
-        time.sleep(0.1)
         audio_queue.stop()
         playback_thread.join()
-
-        def playback_wrapper():
-            timing_info["playback_start"] = time.perf_counter()
-            result = audio_playback_worker(audio_queue)
-            return result
-
-        playback_thread = threading.Thread(target=playback_wrapper)
 
         timing_info["end"] = time.perf_counter()
         print_timing_chart(timing_info)

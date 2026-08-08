@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     POCKET_TTS_URL: str = Field(
         default="http://host.docker.internal:49112/", env="POCKET_TTS_URL"
     )
-    POCKET_TTS_VOICE: str = Field(default="alba", env="POCKET_TTS_VOICE")
+    POCKET_TTS_VOICE: str = Field(default="Jelai.wav", env="POCKET_TTS_VOICE")
     SPEED: float = Field(default=1.0, env="SPEED")
     HUGGINGFACE_TOKEN: Optional[str] = Field(default="", env="HUGGINGFACE_TOKEN")
 
@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     OUTPUT_SAMPLE_RATE: int = Field(default=24000, env="OUTPUT_SAMPLE_RATE")
     RECORD_DURATION: int = Field(default=5, env="RECORD_DURATION")
     SILENCE_THRESHOLD: float = Field(default=0.01, env="SILENCE_THRESHOLD")
-    INTERRUPTION_THRESHOLD: float = Field(default=0.02, env="INTERRUPTION_THRESHOLD")
+    INTERRUPTION_THRESHOLD: float = Field(default=0.15, env="INTERRUPTION_THRESHOLD")
     MAX_SILENCE_DURATION: int = Field(default=1, env="MAX_SILENCE_DURATION")
     SPEECH_CHECK_TIMEOUT: float = Field(default=0.1, env="SPEECH_CHECK_TIMEOUT")
     SPEECH_CHECK_THRESHOLD: float = Field(default=0.02, env="SPEECH_CHECK_THRESHOLD")
