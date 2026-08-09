@@ -16,6 +16,7 @@ def filter_response(response: str) -> str:
     """
     response = re.sub(r"\*\*|__|~~|`", "", response)
     response = re.sub(r"\(.*?\)", "", response)
+    response = re.sub(r"[()\[\]{}]", "", response)
     response = re.sub(r"[\U00010000-\U0010ffff]", "", response, flags=re.UNICODE)
     return response
 
