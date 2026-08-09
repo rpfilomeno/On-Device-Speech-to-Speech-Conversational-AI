@@ -108,17 +108,19 @@ def process_input(
                         if not timing_info["audio_queued"]:
                             timing_info["audio_queued"] = time.perf_counter()
                         remaining = chunker.process(text, audio_queue)
-                        chunker.current_text = [remaining]
-                        complete_response.append(text[: len(text) - len(remaining)])
+                        chunker.current_text = [remaining] if remaining else []
+                        processed_len = len(text) - len(remaining)
+                        if processed_len > 0:
+                            complete_response.append(text[:processed_len])
 
             if choice.get("finish_reason") == "stop":
-                final_text = "".join(chunker.current_text).strip()
-                if final_text:
-                    chunker.process(final_text, audio_queue)
-                    complete_response.append(final_text)
                 break
 
-        messages.append({"role": "assistant", "content": " ".join(complete_response)})
+        final_flushed = chunker.flush(audio_queue)
+        if final_flushed:
+            complete_response.append(final_flushed)
+
+        messages.append({"role": "assistant", "content": " ".join(complete_response).strip()})
         print()
 
         audio_queue.stop()
@@ -150,21 +152,25 @@ def audio_playback_worker(audio_queue) -> tuple[bool, None]:
 
     try:
         while True:
-            speech_detected, audio_data = check_for_speech()
-            if speech_detected:
-                was_interrupted = True
-                interrupt_audio = audio_data
-                audio_queue.clear_queues()
-                break
+            if audio_queue.audio_queue.empty():
+                speech_detected, audio_data = check_for_speech()
+                if speech_detected:
+                    was_interrupted = True
+                    interrupt_audio = audio_data
+                    print("\n[TTS Interrupted] Speech detected from microphone! Clearing audio queues...")
+                    audio_queue.clear_queues()
+                    break
 
-            audio_data, _ = audio_queue.get_next_audio()
+            audio_data, sentence = audio_queue.get_next_audio()
             if audio_data is not None:
                 if not timing_info["first_audio_play"]:
                     timing_info["first_audio_play"] = time.perf_counter()
 
+                print(f"[TTS Playing] {sentence!r}")
                 was_interrupted, interrupt_data = play_audio_with_interrupt(audio_data)
                 if was_interrupted:
                     interrupt_audio = interrupt_data
+                    print("\n[TTS Interrupted] Interrupted during playback! Clearing audio queues...")
                     audio_queue.clear_queues()
                     break
             else:

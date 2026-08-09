@@ -31,6 +31,7 @@ class AudioGenerationQueue:
         self.sentence_queue = Queue()
         self.audio_queue = Queue()
         self.is_running = False
+        self.is_generating = False
         self.generation_thread = None
         self.sentences_processed = 0
         self.audio_generated = 0
@@ -50,14 +51,12 @@ class AudioGenerationQueue:
     def stop(self):
         """
         Stop the audio generation thread gracefully.
-        Waits for the current queue to be processed before stopping.
+        Waits for the current queue and active synthesis to complete before stopping.
         Outputs final processing statistics.
         """
         if self.generation_thread:
-            while not self.sentence_queue.empty():
-                time.sleep(0.1)
-
-            time.sleep(0.5)
+            while not self.sentence_queue.empty() or self.is_generating:
+                time.sleep(0.05)
 
             self.is_running = False
             self.generation_thread.join()
@@ -78,24 +77,25 @@ class AudioGenerationQueue:
         for sentence in sentences:
             sentence = sentence.strip()
             if sentence:
+                print(f"\n[TTS Queued] {sentence!r}")
                 self.sentence_queue.put(sentence)
                 added_count += 1
 
         if not self.is_running:
             self.start()
 
-    def get_next_audio(self) -> Tuple[Optional[np.ndarray], None]:
+    def get_next_audio(self) -> Tuple[Optional[np.ndarray], Optional[str]]:
         """
         Retrieve the next generated audio segment from the queue.
 
         Returns:
             Tuple containing:
                 - numpy array of audio data (or None if queue is empty)
-                - None placeholder
+                - original sentence text (or None)
         """
         try:
-            audio_data, _ = self.audio_queue.get_nowait()
-            return audio_data, None
+            audio_data, sentence = self.audio_queue.get_nowait()
+            return audio_data, sentence
         except:
             return None, None
 
@@ -133,6 +133,8 @@ class AudioGenerationQueue:
                     continue
 
                 try:
+                    self.is_generating = True
+                    print(f"[TTS Synthesizing] Chunk #{self.sentences_processed}: {sentence!r}")
                     audio_data, _ = self.generator.generate(
                         sentence, speed=self.speed
                     )
@@ -141,12 +143,16 @@ class AudioGenerationQueue:
                         raise ValueError("Generated audio data is empty")
 
                     self.audio_generated += 1
-                    self.audio_queue.put((audio_data, None))
+                    print(f"[TTS Synthesized] Chunk #{self.audio_generated} successfully ({len(audio_data)} samples): {sentence!r}")
+                    self.audio_queue.put((audio_data, sentence))
 
                 except Exception as e:
                     error_msg = str(e)
+                    print(f"[TTS Error] Failed chunk #{self.sentences_processed} {sentence!r}: {error_msg}")
                     self.failed_sentences.append((sentence, error_msg))
                     continue
+                finally:
+                    self.is_generating = False
 
             except Exception as e:
                 if not self.is_running and self.sentence_queue.empty():

@@ -278,12 +278,15 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
                 channels=1, callback=output_callback, samplerate=sample_rate
             ):
                 while output_callback.position < len(audio_data):
-                    sd.sleep(100)
+                    sd.sleep(50)
                     if not interrupt_queue.empty():
                         return True, None
-        return False, None
+        
+        is_interrupted = not interrupt_queue.empty()
+        return is_interrupted, None
     except sd.CallbackStop:
-        return True, None
+        is_interrupted = not interrupt_queue.empty()
+        return is_interrupted, None
     except Exception as e:
         print(f"Error during playback: {str(e)}")
         return False, None

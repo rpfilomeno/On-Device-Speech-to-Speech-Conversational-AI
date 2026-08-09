@@ -111,10 +111,73 @@ class TextChunker:
 
         if split_point:
             chunk = " ".join(words[:split_point]).strip()
-            if chunk and any(c.isalnum() for c in chunk):
+            remaining = " ".join(words[split_point:]) if split_point < len(words) else ""
+            if chunk:
                 chunk = chunk.rstrip(",")
                 audio_queue.add_sentences([chunk])
                 self.found_first_sentence = True
-                return " ".join(words[split_point:]) if split_point < len(words) else ""
+                return remaining
+            else:
+                return remaining
 
         return ""
+
+    def flush(self, audio_queue) -> str:
+        """Flushes all remaining text in current_text to the audio queue, ensuring no text is lost.
+
+        Args:
+            audio_queue: The audio queue to add sentences to.
+
+        Returns:
+            str: The flushed text content.
+        """
+        full_text = "".join(self.current_text).strip()
+        self.current_text = []
+        if not full_text:
+            return ""
+
+        remaining = full_text
+        flushed_chunks = []
+
+        while remaining.strip():
+            words = remaining.strip().split()
+            if not words:
+                break
+
+            target_size = (
+                settings.FIRST_SENTENCE_SIZE
+                if not self.found_first_sentence
+                else settings.TARGET_SIZE
+            )
+
+            if len(words) <= target_size:
+                chunk = " ".join(words).strip()
+                if chunk:
+                    chunk = chunk.rstrip(",")
+                    audio_queue.add_sentences([chunk])
+                    self.found_first_sentence = True
+                    flushed_chunks.append(chunk)
+                break
+
+            split_point = self.find_break_point(words, target_size)
+            if split_point > 0:
+                chunk = " ".join(words[:split_point]).strip()
+                if chunk:
+                    chunk = chunk.rstrip(",")
+                    audio_queue.add_sentences([chunk])
+                    self.found_first_sentence = True
+                    flushed_chunks.append(chunk)
+
+                remaining = " ".join(words[split_point:]).strip() if split_point < len(words) else ""
+            else:
+                chunk = " ".join(words).strip()
+                if chunk:
+                    chunk = chunk.rstrip(",")
+                    audio_queue.add_sentences([chunk])
+                    self.found_first_sentence = True
+                    flushed_chunks.append(chunk)
+                break
+
+        return " ".join(flushed_chunks)
+
+
