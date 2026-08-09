@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     TARGET_SIZE: int = Field(default=15, env="TARGET_SIZE")
     FIRST_SENTENCE_SIZE: int = Field(default=3, env="FIRST_SENTENCE_SIZE")
     PLAYBACK_DELAY: float = Field(default=0.005, env="PLAYBACK_DELAY")
+    LOG_TTS_CHUNKS: bool = Field(default=True, env="LOG_TTS_CHUNKS")
 
     def setup_directories(self):
         """Create necessary directories if they don't exist"""

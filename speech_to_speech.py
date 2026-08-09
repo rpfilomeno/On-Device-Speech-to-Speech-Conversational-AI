@@ -157,7 +157,8 @@ def audio_playback_worker(audio_queue) -> tuple[bool, None]:
                 if speech_detected:
                     was_interrupted = True
                     interrupt_audio = audio_data
-                    print("\n[TTS Interrupted] Speech detected from microphone! Clearing audio queues...")
+                    if settings.LOG_TTS_CHUNKS:
+                        print("\n[TTS Interrupted] Speech detected from microphone! Clearing audio queues...")
                     audio_queue.clear_queues()
                     break
 
@@ -166,11 +167,13 @@ def audio_playback_worker(audio_queue) -> tuple[bool, None]:
                 if not timing_info["first_audio_play"]:
                     timing_info["first_audio_play"] = time.perf_counter()
 
-                print(f"[TTS Playing] {sentence!r}")
+                if settings.LOG_TTS_CHUNKS:
+                    print(f"[TTS Playing] {sentence!r}")
                 was_interrupted, interrupt_data = play_audio_with_interrupt(audio_data)
                 if was_interrupted:
                     interrupt_audio = interrupt_data
-                    print("\n[TTS Interrupted] Interrupted during playback! Clearing audio queues...")
+                    if settings.LOG_TTS_CHUNKS:
+                        print("\n[TTS Interrupted] Interrupted during playback! Clearing audio queues...")
                     audio_queue.clear_queues()
                     break
             else:

@@ -5,6 +5,8 @@ from typing import Optional, Tuple, List
 import numpy as np
 import logging
 
+from .config import settings
+
 logging.getLogger("phonemizer").setLevel(logging.ERROR)
 logging.getLogger("speechbrain.utils.quirks").setLevel(logging.ERROR)
 logging.basicConfig(format="%(message)s", level=logging.INFO)
@@ -77,7 +79,8 @@ class AudioGenerationQueue:
         for sentence in sentences:
             sentence = sentence.strip()
             if sentence:
-                print(f"\n[TTS Queued] {sentence!r}")
+                if settings.LOG_TTS_CHUNKS:
+                    print(f"\n[TTS Queued] {sentence!r}")
                 self.sentence_queue.put(sentence)
                 added_count += 1
 
@@ -134,7 +137,8 @@ class AudioGenerationQueue:
 
                 try:
                     self.is_generating = True
-                    print(f"[TTS Synthesizing] Chunk #{self.sentences_processed}: {sentence!r}")
+                    if settings.LOG_TTS_CHUNKS:
+                        print(f"[TTS Synthesizing] Chunk #{self.sentences_processed}: {sentence!r}")
                     audio_data, _ = self.generator.generate(
                         sentence, speed=self.speed
                     )
@@ -143,12 +147,14 @@ class AudioGenerationQueue:
                         raise ValueError("Generated audio data is empty")
 
                     self.audio_generated += 1
-                    print(f"[TTS Synthesized] Chunk #{self.audio_generated} successfully ({len(audio_data)} samples): {sentence!r}")
+                    if settings.LOG_TTS_CHUNKS:
+                        print(f"[TTS Synthesized] Chunk #{self.audio_generated} successfully ({len(audio_data)} samples): {sentence!r}")
                     self.audio_queue.put((audio_data, sentence))
 
                 except Exception as e:
                     error_msg = str(e)
-                    print(f"[TTS Error] Failed chunk #{self.sentences_processed} {sentence!r}: {error_msg}")
+                    if settings.LOG_TTS_CHUNKS:
+                        print(f"[TTS Error] Failed chunk #{self.sentences_processed} {sentence!r}: {error_msg}")
                     self.failed_sentences.append((sentence, error_msg))
                     continue
                 finally:
