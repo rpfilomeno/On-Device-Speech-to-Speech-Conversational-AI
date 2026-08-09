@@ -235,7 +235,18 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
     Returns:
         tuple: A tuple containing a boolean indicating if playback was interrupted and None, or (False, None) if playback completes without interruption.
     """
+    from .aec import EchoCanceller
+    from .audio_processor import NoiseSuppressor, TransientSuppressor, AutomaticGainControl
     interrupt_queue = Queue()
+    aec = EchoCanceller(
+        filter_length=settings.AEC_FILTER_LENGTH, mu=settings.AEC_MU
+    ) if settings.ENABLE_AEC else None
+    noise_suppressor = NoiseSuppressor() if settings.ENABLE_NOISE_SUPPRESSION else None
+    transient_suppressor = TransientSuppressor() if settings.ENABLE_NOISE_SUPPRESSION else None
+    agc = AutomaticGainControl(target_db=settings.AGC_TARGET_DB) if settings.ENABLE_AGC else None
+
+    # Reference buffer of current playing chunk for AEC
+    ref_chunk = np.zeros(settings.CHUNK, dtype=np.float32)
 
     def input_callback(indata, frames, time, status):
         """Callback for monitoring input audio."""
@@ -243,13 +254,38 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
             print(f"Input status: {status}")
             return
 
-        audio_level = np.abs(indata[:, 0]).mean()
+        mic_signal = indata[:, 0]
+        if aec is not None:
+            # Resample or match reference chunk length for AEC
+            ref_signal = ref_chunk
+            if len(ref_signal) != len(mic_signal):
+                ref_signal = np.interp(
+                    np.linspace(0, 1, len(mic_signal)),
+                    np.linspace(0, 1, len(ref_signal)),
+                    ref_signal
+                )
+            mic_signal = aec.process_block(mic_signal, ref_signal)
+
+        # 1. Spectral Subtraction (Steady fan/AC noise)
+        if noise_suppressor is not None:
+            mic_signal = noise_suppressor.process_block(mic_signal)
+
+        # 2. Transient Suppressor (Clicks/keyboard taps)
+        if transient_suppressor is not None:
+            mic_signal = transient_suppressor.process_block(mic_signal)
+
+        # 3. AGC (Gain control/normalization)
+        if agc is not None:
+            mic_signal = agc.process_block(mic_signal)
+
+        audio_level = np.abs(mic_signal).mean()
         if audio_level > settings.INTERRUPTION_THRESHOLD:
             print(f"\n[Interruption Detected] Audio Level: {audio_level:.4f} > {settings.INTERRUPTION_THRESHOLD}")
             interrupt_queue.put(True)
 
     def output_callback(outdata, frames, time, status):
         """Callback for output audio."""
+        nonlocal ref_chunk
         if status:
             print(f"Output status: {status}")
             return
@@ -261,12 +297,16 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
         if remaining == 0:
             raise sd.CallbackStop()
         valid_frames = min(remaining, frames)
-        outdata[:valid_frames, 0] = audio_data[
+        played_frames = audio_data[
             output_callback.position : output_callback.position + valid_frames
         ]
+        outdata[:valid_frames, 0] = played_frames
         if valid_frames < frames:
             outdata[valid_frames:] = 0
         output_callback.position += valid_frames
+
+        # Store played frames as reference for AEC
+        ref_chunk = played_frames.astype(np.float32)
 
     output_callback.position = 0
 

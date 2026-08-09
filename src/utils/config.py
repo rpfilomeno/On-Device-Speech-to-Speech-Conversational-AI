@@ -53,6 +53,14 @@ class Settings(BaseSettings):
     FIRST_SENTENCE_SIZE: int = Field(default=3, env="FIRST_SENTENCE_SIZE")
     PLAYBACK_DELAY: float = Field(default=0.005, env="PLAYBACK_DELAY")
 
+    ENABLE_AEC: bool = Field(default=True, env="ENABLE_AEC")
+    AEC_FILTER_LENGTH: int = Field(default=512, env="AEC_FILTER_LENGTH")
+    AEC_MU: float = Field(default=0.1, env="AEC_MU")
+
+    ENABLE_NOISE_SUPPRESSION: bool = Field(default=True, env="ENABLE_NOISE_SUPPRESSION")
+    ENABLE_AGC: bool = Field(default=True, env="ENABLE_AGC")
+    AGC_TARGET_DB: float = Field(default=-16.0, env="AGC_TARGET_DB")
+
     def setup_directories(self):
         """Create necessary directories if they don't exist"""
         self.MODELS_DIR.mkdir(parents=True, exist_ok=True)

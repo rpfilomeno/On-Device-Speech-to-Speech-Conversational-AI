@@ -9,6 +9,8 @@ from .speech import (
 )
 from .config import settings
 from .text_chunker import TextChunker
+from .aec import EchoCanceller
+from .audio_processor import NoiseSuppressor, TransientSuppressor, AutomaticGainControl
 
 __all__ = [
     'play_audio',
@@ -26,4 +28,8 @@ __all__ = [
     'transcribe_audio',
     'settings',
     'TextChunker',
+    'EchoCanceller',
+    'NoiseSuppressor',
+    'TransientSuppressor',
+    'AutomaticGainControl',
 ] 
