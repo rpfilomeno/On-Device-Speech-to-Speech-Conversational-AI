@@ -10,6 +10,7 @@ from src.utils import (
     get_ai_response,
     play_audio_with_interrupt,
     init_vad_pipeline,
+    init_whisper_model,
     detect_speech_segments,
     record_continuous_audio,
     check_for_speech,
@@ -200,11 +201,8 @@ def main():
             generator = VoiceGenerator()
             messages = [{"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT}]
             print("\nInitializing Whisper model...")
-            whisper_processor = WhisperProcessor.from_pretrained(
-                settings.WHISPER_MODEL, local_files_only=True
-            )
-            whisper_model = WhisperForConditionalGeneration.from_pretrained(
-                settings.WHISPER_MODEL, local_files_only=True
+            whisper_processor, whisper_model = init_whisper_model(
+                settings.WHISPER_MODEL_ID, settings.WHISPER_MODEL_DIR, hf_token=settings.HUGGINGFACE_TOKEN
             )
             print("\nInitializing Voice Activity Detection...")
             vad_pipeline = init_vad_pipeline(settings.HUGGINGFACE_TOKEN)

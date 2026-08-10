@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 import pyaudio
 import numpy as np
 import torch
@@ -16,6 +18,83 @@ SPEECH_CHECK_THRESHOLD = settings.SPEECH_CHECK_THRESHOLD
 MAX_SILENCE_DURATION = settings.MAX_SILENCE_DURATION
 
 
+def ensure_model_downloaded(repo_id: str, local_dir: str, token: str = None) -> Path:
+    """Ensures that a Hugging Face model repository is downloaded into a local directory.
+
+    If the local directory does not exist or is empty, downloads from HF Hub.
+
+    Args:
+        repo_id (str): Hugging Face repository ID (e.g., 'openai/whisper-base.en').
+        local_dir (str): Local directory path to store model files.
+        token (str, optional): Hugging Face token for gated/private repositories.
+
+    Returns:
+        Path: Path object pointing to the local directory.
+    """
+    target_path = Path(local_dir)
+    if not target_path.is_absolute():
+        target_path = settings.BASE_DIR / target_path
+
+    if not target_path.exists() or not any(target_path.iterdir()):
+        print(f"\nModel files not found at '{target_path}'. Downloading '{repo_id}' from Hugging Face...")
+        target_path.mkdir(parents=True, exist_ok=True)
+
+        from huggingface_hub import snapshot_download
+
+        orig_hf_offline = os.environ.get("HF_HUB_OFFLINE")
+        orig_tf_offline = os.environ.get("TRANSFORMERS_OFFLINE")
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+
+        try:
+            download_kwargs = {
+                "repo_id": repo_id,
+                "local_dir": str(target_path),
+            }
+            if token:
+                download_kwargs["token"] = token
+
+            snapshot_download(**download_kwargs)
+            print(f"Successfully downloaded '{repo_id}' to '{target_path}'.")
+        finally:
+            if orig_hf_offline is not None:
+                os.environ["HF_HUB_OFFLINE"] = orig_hf_offline
+            if orig_tf_offline is not None:
+                os.environ["TRANSFORMERS_OFFLINE"] = orig_tf_offline
+
+    return target_path
+
+
+def init_whisper_model(model_id: str = None, model_dir: str = None, hf_token: str = None):
+    """Initializes the Whisper processor and model, downloading to local_dir first if missing.
+
+    Args:
+        model_id (str, optional): Hugging Face repo ID. Defaults to settings.WHISPER_MODEL_ID.
+        model_dir (str, optional): Local target directory. Defaults to settings.WHISPER_MODEL_DIR.
+        hf_token (str, optional): Hugging Face API token.
+
+    Returns:
+        tuple: (WhisperProcessor, WhisperForConditionalGeneration)
+    """
+    from transformers import WhisperProcessor, WhisperForConditionalGeneration
+
+    if model_id is None:
+        model_id = settings.WHISPER_MODEL_ID
+    if model_dir is None:
+        model_dir = settings.WHISPER_MODEL_DIR
+
+    local_path = ensure_model_downloaded(model_id, model_dir, token=hf_token)
+
+    whisper_processor = WhisperProcessor.from_pretrained(
+        str(local_path), local_files_only=True
+    )
+    whisper_model = WhisperForConditionalGeneration.from_pretrained(
+        str(local_path), local_files_only=True
+    )
+
+    return whisper_processor, whisper_model
+
+
 def init_vad_pipeline(hf_token):
     """Initializes the Voice Activity Detection pipeline.
 
@@ -28,8 +107,14 @@ def init_vad_pipeline(hf_token):
     from pyannote.audio import Model
     from pyannote.audio.pipelines import VoiceActivityDetection
 
+    vad_dir = ensure_model_downloaded(
+        repo_id=settings.VAD_MODEL_ID,
+        local_dir=settings.VAD_MODEL_DIR,
+        token=hf_token,
+    )
+
     model = Model.from_pretrained(
-        settings.VAD_MODEL, use_auth_token=hf_token, local_files_only=True
+        str(vad_dir), use_auth_token=hf_token, local_files_only=True
     )
 
     pipeline = VoiceActivityDetection(segmentation=model)

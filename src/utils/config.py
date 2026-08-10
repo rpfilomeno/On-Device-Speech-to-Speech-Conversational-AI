@@ -32,9 +32,19 @@ class Settings(BaseSettings):
     MAX_TOKENS: int = Field(default=512, env="MAX_TOKENS")
     LLM_TEMPERATURE: float = Field(default=0.7, env="LMM_TEMPERATURE")
 
-    WHISPER_MODEL: str = Field(default="openai/whisper-tiny.en", env="WHISPER_MODEL")
+    WHISPER_MODEL_ID: str = Field(
+        default="openai/whisper-tiny.en", env="WHISPER_MODEL_ID"
+    )
+    WHISPER_MODEL_DIR: str = Field(
+        default="data/models/whisper-tiny.en", env="WHISPER_MODEL_DIR"
+    )
 
-    VAD_MODEL: str = Field(default="pyannote/segmentation-3.0", env="VAD_MODEL")
+    VAD_MODEL_ID: str = Field(
+        default="pyannote/segmentation-3.0", env="VAD_MODEL_ID"
+    )
+    VAD_MODEL_DIR: str = Field(
+        default="data/models/segmentation-3.0", env="VAD_MODEL_DIR"
+    )
     VAD_MIN_DURATION_ON: float = Field(default=0.1, env="VAD_MIN_DURATION_ON")
     VAD_MIN_DURATION_OFF: float = Field(default=0.1, env="VAD_MIN_DURATION_OFF")
 
