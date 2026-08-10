@@ -63,36 +63,12 @@ class VoiceGenerator:
         if self.pocket_tts_voice:
             payload["voice"] = self.pocket_tts_voice
 
-        endpoints = [
-            (f"{self.pocket_tts_url}/v1/audio/speech", "POST", payload),
-            (f"{self.pocket_tts_url}/tts", "POST", {"text": text, "voice": self.pocket_tts_voice}),
-            (f"{self.pocket_tts_url}/tts", "GET", {"text": text}),
-        ]
+        endpoint = f"{self.pocket_tts_url}/v1/audio/speech"
 
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                res = None
-                last_err = None
-                for ep, method, data in endpoints:
-                    try:
-                        if method == "POST":
-                            resp = requests.post(ep, json=data, stream=True, timeout=10)
-                        else:
-                            resp = requests.get(ep, params=data, stream=True, timeout=10)
-
-                        if resp.status_code == 200:
-                            res = resp
-                            break
-                        else:
-                            last_err = f"Endpoint {ep} returned HTTP {resp.status_code}"
-                    except requests.RequestException as req_err:
-                        last_err = str(req_err)
-                        continue
-
-                if res is None:
-                    raise ValueError(f"Could not connect to Pocket TTS server at {self.pocket_tts_url}. Last error: {last_err}")
-
+                res = requests.post(endpoint, json=payload, stream=True, timeout=10)
                 res.raise_for_status()
 
                 audio_bytes = bytearray()
