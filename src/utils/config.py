@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     )
     POCKET_TTS_VOICE: str = Field(default="Jelai.wav", env="POCKET_TTS_VOICE")
     SPEED: float = Field(default=1.0, env="SPEED")
+    TTS_MAX_RETRIES: int = Field(default=3, env="TTS_MAX_RETRIES")
     HUGGINGFACE_TOKEN: Optional[str] = Field(default="", env="HUGGINGFACE_TOKEN")
 
     LM_STUDIO_URL: str = Field(..., env="LM_STUDIO_URL")

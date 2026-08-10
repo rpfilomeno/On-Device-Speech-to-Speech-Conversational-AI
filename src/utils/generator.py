@@ -1,8 +1,10 @@
 import io
 import logging
+import time
 import requests
 import soundfile as sf
 from pathlib import Path
+from .config import settings
 
 
 class VoiceGenerator:
@@ -38,10 +40,11 @@ class VoiceGenerator:
         text,
         speed=1.0,
         return_chunks=False,
+        max_retries=None,
         **kwargs
     ):
         """
-        Generates speech from given text via Pocket TTS HTTP streaming.
+        Generates speech from given text via Pocket TTS HTTP streaming with retry logic.
         """
         if not self.is_initialized():
             raise RuntimeError("Pocket TTS not initialized. Call initialize() first.")
@@ -50,53 +53,65 @@ class VoiceGenerator:
         if not text:
             return (None, []) if not return_chunks else ([], [])
 
-        try:
-            payload = {
-                "input": text,
-                "model": "pocket-tts",
-            }
-            if self.pocket_tts_voice:
-                payload["voice"] = self.pocket_tts_voice
+        if max_retries is None:
+            max_retries = getattr(settings, "TTS_MAX_RETRIES", 3)
 
-            endpoints = [
-                (f"{self.pocket_tts_url}/v1/audio/speech", "POST", payload),
-                (f"{self.pocket_tts_url}/tts", "POST", {"text": text, "voice": self.pocket_tts_voice}),
-                (f"{self.pocket_tts_url}/tts", "GET", {"text": text}),
-            ]
-            res = None
-            last_err = None
-            for ep, method, data in endpoints:
-                try:
-                    if method == "POST":
-                        resp = requests.post(ep, json=data, stream=True, timeout=10)
-                    else:
-                        resp = requests.get(ep, params=data, stream=True, timeout=10)
+        payload = {
+            "input": text,
+            "model": "pocket-tts",
+        }
+        if self.pocket_tts_voice:
+            payload["voice"] = self.pocket_tts_voice
 
-                    if resp.status_code == 200:
-                        res = resp
-                        break
-                    else:
-                        last_err = f"Endpoint {ep} returned HTTP {resp.status_code}"
-                except requests.RequestException as req_err:
-                    last_err = str(req_err)
-                    continue
+        endpoints = [
+            (f"{self.pocket_tts_url}/v1/audio/speech", "POST", payload),
+            (f"{self.pocket_tts_url}/tts", "POST", {"text": text, "voice": self.pocket_tts_voice}),
+            (f"{self.pocket_tts_url}/tts", "GET", {"text": text}),
+        ]
 
-            if res is None:
-                raise ValueError(f"Could not connect to Pocket TTS server at {self.pocket_tts_url}. Last error: {last_err}")
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                res = None
+                last_err = None
+                for ep, method, data in endpoints:
+                    try:
+                        if method == "POST":
+                            resp = requests.post(ep, json=data, stream=True, timeout=10)
+                        else:
+                            resp = requests.get(ep, params=data, stream=True, timeout=10)
 
-            res.raise_for_status()
+                        if resp.status_code == 200:
+                            res = resp
+                            break
+                        else:
+                            last_err = f"Endpoint {ep} returned HTTP {resp.status_code}"
+                    except requests.RequestException as req_err:
+                        last_err = str(req_err)
+                        continue
 
-            audio_bytes = bytearray()
-            for chunk in res.iter_content(chunk_size=4096):
-                if chunk:
-                    audio_bytes.extend(chunk)
+                if res is None:
+                    raise ValueError(f"Could not connect to Pocket TTS server at {self.pocket_tts_url}. Last error: {last_err}")
 
-            if not audio_bytes:
-                raise ValueError("Received empty audio response from Pocket TTS server")
+                res.raise_for_status()
 
-            audio_data, _ = sf.read(io.BytesIO(audio_bytes), dtype='float32')
-            return (audio_data, []) if not return_chunks else ([audio_data], [])
-        except Exception as e:
-            logging.error(f"Pocket TTS error: {str(e)}")
-            raise ValueError(f"Error in Pocket TTS generation: {str(e)}")
+                audio_bytes = bytearray()
+                for chunk in res.iter_content(chunk_size=4096):
+                    if chunk:
+                        audio_bytes.extend(chunk)
+
+                if not audio_bytes:
+                    raise ValueError("Received empty audio response from Pocket TTS server")
+
+                audio_data, _ = sf.read(io.BytesIO(audio_bytes), dtype='float32')
+                return (audio_data, []) if not return_chunks else ([audio_data], [])
+            except Exception as e:
+                last_error = e
+                logging.warning(f"Pocket TTS attempt {attempt}/{max_retries} failed: {str(e)}")
+                if attempt < max_retries:
+                    time.sleep(0.5)
+
+        logging.error(f"Pocket TTS generation failed after {max_retries} retries: {str(last_error)}")
+        raise ValueError(f"Error in Pocket TTS generation after {max_retries} attempts: {str(last_error)}")
+
 
