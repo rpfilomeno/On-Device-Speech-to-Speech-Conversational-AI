@@ -137,7 +137,7 @@ def audio_playback_worker(audio_queue) -> None:
 
     try:
         while True:
-            audio_data, sentence = audio_queue.get_next_audio()
+            audio_data, sentence, _ = audio_queue.get_next_audio()
             if audio_data is not None:
                 if not timing_info["first_audio_play"]:
                     timing_info["first_audio_play"] = time.perf_counter()

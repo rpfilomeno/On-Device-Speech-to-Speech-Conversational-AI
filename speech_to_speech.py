@@ -314,13 +314,14 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                     audio_queue.clear_queues()
                     break
 
-            audio_data, sentence = audio_queue.get_next_audio()
+            audio_data, sentence, is_first = audio_queue.get_next_audio()
             if audio_data is not None:
                 if not timing_info["first_audio_play"]:
                     timing_info["first_audio_play"] = time.perf_counter()
                     emit("status", "SPEAKING")
 
-                emit("bot_spoken", sentence)
+                if is_first:
+                    emit("bot_spoken", sentence)
                 if settings.LOG_TTS_CHUNKS:
                     emit("log", f"[TTS Playing] {sentence!r}")
                 was_interrupted, interrupt_data = play_audio_with_interrupt(

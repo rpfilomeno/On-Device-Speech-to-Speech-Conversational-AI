@@ -65,7 +65,7 @@ class AudioGenerationQueue:
             self.generation_thread = None
 
             logging.info(
-                f"\n[TTS] Audio Generation Complete - Processed: {self.sentences_processed}, Generated: {self.audio_generated}, Failed: {len(self.failed_sentences)}"
+                f"[TTS] Audio Generation Complete - Processed: {self.sentences_processed}, Generated: {self.audio_generated}, Failed: {len(self.failed_sentences)}"
             )
 
     def add_sentences(self, sentences: List[str]):
@@ -87,7 +87,7 @@ class AudioGenerationQueue:
         if not self.is_running:
             self.start()
 
-    def get_next_audio(self) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    def get_next_audio(self) -> Tuple[Optional[np.ndarray], Optional[str], bool]:
         """
         Retrieve the next generated audio segment from the queue.
 
@@ -95,12 +95,13 @@ class AudioGenerationQueue:
             Tuple containing:
                 - numpy array of audio data (or None if queue is empty)
                 - original sentence text (or None)
+                - whether this segment is the first for its sentence
         """
         try:
-            audio_data, sentence = self.audio_queue.get_nowait()
-            return audio_data, sentence
+            audio_data, sentence, is_first = self.audio_queue.get_nowait()
+            return audio_data, sentence, is_first
         except:
-            return None, None
+            return None, None, True
 
     def clear_queues(self):
         """
@@ -139,18 +140,37 @@ class AudioGenerationQueue:
                     self.is_generating = True
                     if settings.LOG_TTS_CHUNKS:
                         print(f"[TTS Synthesizing] Chunk #{self.sentences_processed}: {sentence!r}")
-                    audio_data, _ = self.generator.generate(
-                        sentence, speed=self.speed
-                    )
 
-                    if audio_data is None or len(audio_data) == 0:
-                        raise ValueError("Generated audio data is empty")
+                    if getattr(self.generator, "streaming", False):
+                        produced = False
+                        buffer = []
+                        for seg in self.generator.generate(
+                            sentence, speed=self.speed, stream=True
+                        ):
+                            if seg is None or len(seg) == 0:
+                                continue
+                            produced = True
+                            buffer.append(seg)
+                        if not produced:
+                            raise ValueError("Generated audio data is empty")
+                        # One segment per sentence: splitting it into smaller pieces
+                        # would make playback reopen the audio device per piece,
+                        # which sounds choppy. The server buffers the WAV anyway,
+                        # so buffering here costs no latency.
+                        self.audio_queue.put(
+                            (np.concatenate(buffer), sentence, True)
+                        )
+                    else:
+                        audio_data, _ = self.generator.generate(
+                            sentence, speed=self.speed
+                        )
+                        if audio_data is None or len(audio_data) == 0:
+                            raise ValueError("Generated audio data is empty")
+                        self.audio_queue.put((audio_data, sentence, True))
 
                     self.audio_generated += 1
                     if settings.LOG_TTS_CHUNKS:
-                        print(f"[TTS Synthesized] Chunk #{self.audio_generated} successfully ({len(audio_data)} samples): {sentence!r}")
-                    self.audio_queue.put((audio_data, sentence))
-
+                        print(f"[TTS Synthesized] Chunk #{self.audio_generated} successfully: {sentence!r}")
                 except Exception as e:
                     error_msg = str(e)
                     if settings.LOG_TTS_CHUNKS:
