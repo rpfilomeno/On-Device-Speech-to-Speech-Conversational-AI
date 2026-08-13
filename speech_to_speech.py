@@ -1,8 +1,8 @@
+import random
 import keyboard
 import traceback
 import time
 import requests
-import time
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from src.utils.config import settings
 from src.utils import (
@@ -15,6 +15,8 @@ from src.utils import (
     record_continuous_audio,
     check_for_speech,
     transcribe_audio,
+    twitch_collector,
+    twitch_bot_manager,
 )
 from src.utils.audio_queue import AudioGenerationQueue
 from src.utils.llm import parse_stream_chunk
@@ -214,6 +216,12 @@ def main():
             )
             print(result)
             speed = settings.SPEED
+
+            # Start Twitch chat bot background listener
+            if settings.TWITCH_CLIENT_CHANNEL:
+                print(f"\nStarting Twitch chat collector for channel: {settings.TWITCH_CLIENT_CHANNEL}...")
+                twitch_bot_manager.start(settings.TWITCH_CLIENT_CHANNEL)
+
             try:
                 print("\nWarming up the LM Studio model...")
                 response_stream = get_ai_response(
@@ -237,6 +245,9 @@ def main():
             print("The bot is now listening for speech.")
             print("Just start speaking, and I'll respond automatically!")
             print("You can interrupt me anytime by starting to speak.")
+
+            last_activity_time = time.time()
+
             while True:
                 try:
                     if keyboard.is_pressed("enter"):
@@ -246,13 +257,22 @@ def main():
                             print("Goodbye!")
                             break
 
-                    audio_data = record_continuous_audio()
+                        if user_input:
+                            last_activity_time = time.time()
+                            was_interrupted, speech_data = process_input(
+                                session, user_input, messages, generator, speed
+                            )
+                            last_activity_time = time.time()
+                            continue
+
+                    audio_data = record_continuous_audio(max_wait=5.0)
                     if audio_data is not None:
                         speech_segments = detect_speech_segments(
                             vad_pipeline, audio_data
                         )
 
                         if speech_segments is not None:
+                            last_activity_time = time.time()
                             print("\nTranscribing detected speech...")
                             timing_info["transcription_start"] = time.perf_counter()
 
@@ -268,6 +288,8 @@ def main():
                                 was_interrupted, speech_data = process_input(
                                     session, user_input, messages, generator, speed
                                 )
+                                last_activity_time = time.time()
+
                                 if was_interrupted and speech_data is not None:
                                     speech_segments = detect_speech_segments(
                                         vad_pipeline, speech_data
@@ -288,8 +310,35 @@ def main():
                                                 generator,
                                                 speed,
                                             )
+                                            last_activity_time = time.time()
                         else:
                             print("No clear speech detected, please try again.")
+                    else:
+                        # Check idle condition if no voice input was detected
+                        idle_elapsed = time.time() - last_activity_time
+                        if idle_elapsed >= settings.MAX_IDLE_TIME:
+                            print(f"\n[Idle Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
+                            
+                            # Check if recent Twitch events/messages are available
+                            twitch_events = twitch_collector.get_recent_events(
+                                max_size=settings.TWITCH_MAX_CHAT_SIZE,
+                                max_age=settings.TWITCH_MAX_CHAT_AGE,
+                            )
+
+                            if twitch_events:
+                                events_summary = "\n".join(twitch_events)
+                                prompt_text = settings.TWITCH_CHAT_PROMPT.format(
+                                    TWITCH_CHATS_AND_EVENTS=events_summary
+                                )
+                                print(f"[Twitch Idle Event] Responding to {len(twitch_events)} collected Twitch event(s)...")
+                            else:
+                                idle_prompts = settings.get_idle_prompts_list()
+                                prompt_text = random.choice(idle_prompts)
+                                print(f"[Random Idle Event] Picked prompt: '{prompt_text}'")
+
+                            process_input(session, prompt_text, messages, generator, speed)
+                            last_activity_time = time.time()
+
                     if session is not None:
                         session.headers.update({"Connection": "keep-alive"})
                         if hasattr(session, "connection_pool"):

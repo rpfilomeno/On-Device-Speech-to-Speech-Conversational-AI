@@ -207,8 +207,11 @@ def record_audio(duration=None):
     return audio_data
 
 
-def record_continuous_audio():
+def record_continuous_audio(max_wait=None):
     """Continuously monitors audio and detects speech segments.
+
+    Args:
+        max_wait (float, optional): Maximum time in seconds to wait for speech before returning None.
 
     Returns:
         np.ndarray or None: Recorded audio data as a numpy array, or None if no speech is detected.
@@ -226,6 +229,7 @@ def record_continuous_audio():
     silence_frames = 0
     max_silence_frames = int(RATE / CHUNK * 1)
     recording = False
+    start_time = time.time()
 
     try:
         while True:
@@ -252,6 +256,8 @@ def record_continuous_audio():
                 if silence_frames >= max_silence_frames:
                     print("Processing speech segment...")
                     break
+            elif max_wait is not None and (time.time() - start_time) >= max_wait:
+                break
 
             time.sleep(0.001)
 
@@ -264,6 +270,7 @@ def record_continuous_audio():
 
     if frames:
         return np.concatenate(frames)
+        
     return None
 
 

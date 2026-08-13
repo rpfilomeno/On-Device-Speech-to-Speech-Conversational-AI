@@ -1579,6 +1579,7 @@ dependencies = [
     { name = "torch" },
     { name = "torch-audiomentations" },
     { name = "transformers" },
+    { name = "twitch-python" },
 ]
 
 [package.metadata]
@@ -1598,6 +1599,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.13.0" },
     { name = "torch-audiomentations", specifier = ">=0.12.0" },
     { name = "transformers", specifier = ">=5.14.1" },
+    { name = "twitch-python", specifier = ">=0.0.20" },
 ]
 
 [[package]]
@@ -5336,6 +5338,15 @@ wheels = [
 ]
 
 [[package]]
+name = "rx"
+version = "3.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/34/b5/e0f602453b64b0a639d56f3c05ab27202a4eec993eb64d66c077c821b621/Rx-3.2.0.tar.gz", hash = "sha256:b657ca2b45aa485da2f7dcfd09fac2e554f7ac51ff3c2f8f2ff962ecd963d91c", size = 105540 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e2/a9/efeaeca4928a9a56d04d609b5730994d610c82cf4d9dd7aa173e6ef4233e/Rx-3.2.0-py3-none-any.whl", hash = "sha256:922c5f4edb3aa1beaa47bf61d65d5380011ff6adcd527f26377d05cb73ed8ec8", size = 199245 },
+]
+
+[[package]]
 name = "safetensors"
 version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -5788,6 +5799,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/a4/09/5683146fda6a2b569deb78ccfd8fbfea8bfe55f726b081c0a6bb18dd6f28/triton-3.7.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2020153b08280415ec0da6607834e79166442147e78e144df06b508c75b186d2", size = 197729537 },
     { url = "https://files.pythonhosted.org/packages/e9/f8/448220c3092019f9fdfab39ec47985968181d67da34b44f6a7f6280a5cbb/triton-3.7.1-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c58e4c61f0c73b5dba3b5d19b4a7093c32f90dc18b2a7f121a7c16ccd31107b7", size = 184814760 },
     { url = "https://files.pythonhosted.org/packages/f0/ac/229b7d4589d2e5937310e72c6d46e89599d16a4a12b479ffa1499fee8eb8/triton-3.7.1-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:10ba85fa2cca4a2fbdeb36bf1cb082f2c252bda55bf9fccd74f65ec5bc647e68", size = 197824404 },
+]
+
+[[package]]
+name = "twitch-python"
+version = "0.0.20"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+    { name = "rx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/da/bb/197e2b5e88f3e3408da050b63720d7cf7268bb6fc66140cf625069293cd9/twitch-python-0.0.20.tar.gz", hash = "sha256:6e09d7210b8e0abb6892767d722079eb35b14c29e770cdb4df64d569ecbaa17c", size = 27170 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/36/fe/d2b3e273017c62c8a3861c45cb574ec49a6afeaf2e0ba07f7ddbb606911b/twitch_python-0.0.20-py3-none-any.whl", hash = "sha256:8fb28e8484ee8151230998a249f72c878c54fe54bedfa5fbc19f4118b6a5afde", size = 30652 },
 ]
 
 [[package]]

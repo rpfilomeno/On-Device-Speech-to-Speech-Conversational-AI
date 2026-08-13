@@ -20,6 +20,7 @@ dependencies = [
   "torch>=2.13.0",
   "torch-audiomentations>=0.12.0",
   "transformers>=5.14.1",
+  "twitch-python>=0.0.20",
 ]
 
 [tool.pyrefly]

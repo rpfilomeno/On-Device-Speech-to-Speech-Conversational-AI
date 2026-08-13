@@ -64,6 +64,29 @@ class Settings(BaseSettings):
     FIRST_SENTENCE_SIZE: int = Field(default=3, env="FIRST_SENTENCE_SIZE")
     PLAYBACK_DELAY: float = Field(default=0.005, env="PLAYBACK_DELAY")
     LOG_TTS_CHUNKS: bool = Field(default=True, env="LOG_TTS_CHUNKS")
+    LOG_TWITCH_CHATS: bool = Field(default=True, env="LOG_TWITCH_CHATS")
+
+    TWITCH_CLIENT_ID: Optional[str] = Field(default="", env="TWITCH_CLIENT_ID")
+    TWITCH_CLIENT_SECRET: Optional[str] = Field(default="", env="TWITCH_CLIENT_SECRET")
+    TWITCH_CLIENT_CHANNEL: Optional[str] = Field(default="", env="TWITCH_CLIENT_CHANNEL")
+    TWITCH_MAX_CHAT_SIZE: int = Field(default=50, env="TWITCH_MAX_CHAT_SIZE")
+    TWITCH_MAX_CHAT_AGE: float = Field(default=180.0, env="TWITCH_MAX_CHAT_AGE")
+
+    MAX_IDLE_TIME: float = Field(default=60.0, env="MAX_IDLE_TIME")
+    TWITCH_CHAT_PROMPT: str = Field(
+        default="You noticed there are messages and events from twitch chat, try to respond or react to them: {TWITCH_CHATS_AND_EVENTS}",
+        env="TWITCH_CHAT_PROMPT",
+    )
+    IDLE_PROMPTS: str = Field(
+        default="Make a joke, Tell what you dreamt last night, Tell us an unforgettable memory, What is the fact-of-the-day, Tell us thinf you plan to do someday",
+        env="IDLE_PROMPTS",
+    )
+
+    def get_idle_prompts_list(self) -> list[str]:
+        """Parses IDLE_PROMPTS string into a list of individual prompt strings."""
+        if not self.IDLE_PROMPTS:
+            return ["Tell us something interesting!"]
+        return [p.strip() for p in self.IDLE_PROMPTS.split(",") if p.strip()]
 
     def setup_directories(self):
         """Create necessary directories if they don't exist"""

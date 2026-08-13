@@ -9,6 +9,7 @@ from .speech import (
 )
 from .config import settings
 from .text_chunker import TextChunker
+from .twitch_bot import twitch_collector, twitch_bot_manager
 
 __all__ = [
     'play_audio',
@@ -28,4 +29,6 @@ __all__ = [
     'ensure_model_downloaded',
     'settings',
     'TextChunker',
+    'twitch_collector',
+    'twitch_bot_manager',
 ] 
