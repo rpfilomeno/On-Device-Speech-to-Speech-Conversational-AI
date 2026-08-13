@@ -1,3 +1,4 @@
+import logging
 import random
 import queue
 import sys
@@ -56,37 +57,105 @@ def emit(kind: str, *payload):
 
 
 class _LogStream:
-    """Captures sys.stdout so every print() (from pipeline, TTS, Twitch bot)
-    lands in the TUI's log panel instead of corrupting the screen."""
+    """Captures sys.stdout/sys.stderr so every print() (from pipeline, TTS,
+    Twitch bot) and traceback lands in the TUI's log panel instead of being
+    printed on top of the screen."""
 
     def __init__(self):
         self._buf = ""
         self._last_flush = 0.0
 
     def write(self, text: str):
-        # keep only the tail after the last \r so tqdm progress bars collapse
-        # into their final line instead of spamming the log panel
-        if "\r" in text:
-            text = text.rsplit("\r", 1)[-1]
-        self._buf += text
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            line = line.strip()
-            if line:
-                emit("log", line)
-        # show long partial lines (e.g. LLM token streaming) roughly twice a second
-        now = time.time()
-        if self._buf.strip() and now - self._last_flush >= 0.5:
-            self._last_flush = now
-            emit("log", self._buf.strip())
+        # never raise / never touch the real terminal: any bad write is dropped
+        try:
+            # keep only the tail after the last \r so tqdm progress bars collapse
+            # into their final line instead of spamming the log panel
+            if "\r" in text:
+                text = text.rsplit("\r", 1)[-1]
+            self._buf += text
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                line = line.strip()
+                if line:
+                    emit("log", line)
+            # show long partial lines (e.g. LLM token streaming) roughly twice a second
+            now = time.time()
+            if self._buf.strip() and now - self._last_flush >= 0.5:
+                self._last_flush = now
+                emit("log", self._buf.strip())
+        except Exception:
+            pass
 
     def flush(self):
-        if self._buf.strip():
-            emit("log", self._buf.strip())
-            self._buf = ""
+        try:
+            if self._buf.strip():
+                emit("log", self._buf.strip())
+                self._buf = ""
+        except Exception:
+            pass
 
 
 _log_stream = _LogStream()
+
+
+class _LogHandler(logging.Handler):
+    """Routes every logging record (PocketTTS retries, audio stats, ...) to the
+    TUI log panel instead of the raw stderr stream."""
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+            if msg.strip():
+                emit("log", msg)
+        except Exception:
+            pass
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    try:
+        emit("error", f"Unhandled {exc_type.__name__}: {exc_value}")
+        for line in traceback.format_exception(exc_type, exc_value, exc_tb):
+            emit("log", line.rstrip())
+    except Exception:
+        pass
+
+
+def _thread_excepthook(args):
+    try:
+        emit("error", f"Unhandled {args.exc_type.__name__} in thread '{args.thread.name}': {args.exc_value}")
+        for line in traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback):
+            emit("log", line.rstrip())
+    except Exception:
+        pass
+
+
+_orig_excepthook = sys.excepthook
+_orig_thread_excepthook = threading.excepthook
+
+
+def _install_error_routing():
+    """Redirect all error output (prints, logging, unhandled exceptions) into
+    the TUI event queue so nothing can be written over the screen."""
+    sys.stdout = _log_stream
+    sys.stderr = _log_stream
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+    # Replace any handler created at import time (e.g. audio_queue's
+    # logging.basicConfig bound to the original stderr) with one that feeds
+    # the log panel. Also prevents later basicConfig() calls from adding more.
+    logger = logging.getLogger()
+    handler = _LogHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.handlers[:] = [handler]
+
+
+def _restore_error_routing():
+    if isinstance(sys.stdout, _LogStream):
+        sys.stdout = sys.__stdout__
+    if isinstance(sys.stderr, _LogStream):
+        sys.stderr = sys.__stderr__
+    sys.excepthook = _orig_excepthook
+    threading.excepthook = _orig_thread_excepthook
 
 
 def process_input(
@@ -439,18 +508,25 @@ class ChatInput(Input):
     ]
 
     def action_unfocus(self):
-        self.screen.set_focus(None)
+        try:
+            self.screen.set_focus(None)
+        except Exception as e:
+            emit("error", f"unfocus error: {type(e).__name__}: {e}")
 
     def action_exit_app(self):
         self.app.exit()
 
     def on_input_submitted(self, event: Input.Submitted):
-        text = event.value.strip()
-        if text:
-            text_input_queue.put(text)
-            emit("activity")
-            emit("transcript", "text", text)
-            self.value = ""
+        try:
+            text = event.value.strip()
+            if text:
+                text_input_queue.put(text)
+                emit("activity")
+                emit("transcript", "text", text)
+                self.value = ""
+        except Exception as e:
+            # never raise out of a message handler (Textual would panic the app)
+            emit("error", f"text input error: {type(e).__name__}: {e}")
 
 
 class SpeechTUI(App):
@@ -519,8 +595,7 @@ class SpeechTUI(App):
         self.history_log: RichLog = self.query_one("#history-log", RichLog)
         self.log_panel: RichLog = self.query_one("#log", RichLog)
 
-        sys.stdout = _log_stream
-        sys.stderr = _log_stream
+        _install_error_routing()
         self.set_interval(0.1, self._poll_events)
         self.set_interval(0.25, self._update_idle)
         threading.Thread(target=pipeline_main, daemon=True).start()
@@ -528,10 +603,7 @@ class SpeechTUI(App):
 
     def on_unmount(self):
         shutdown_event.set()
-        if isinstance(sys.stdout, _LogStream):
-            sys.stdout = sys.__stdout__
-        if isinstance(sys.stderr, _LogStream):
-            sys.stderr = sys.__stderr__
+        _restore_error_routing()
 
     def action_focus_input(self):
         self.query_one("#text-input", Input).focus()
@@ -562,49 +634,68 @@ class SpeechTUI(App):
                 self._handle(kind, *payload)
         except queue.Empty:
             pass
-        self._update_twitch()
+        try:
+            self._update_twitch()
+        except Exception as e:
+            self._log_tui_error("twitch panel", e)
+
+    def _log_tui_error(self, context: str, error: Exception):
+        """Write an exception to the log panel; must never raise (a raised
+        exception here would make Textual panic and tear down the TUI)."""
+        try:
+            self.log_panel.write(f"[bold red]{context}: {type(error).__name__}: {error}[/]")
+            for line in traceback.format_exc().splitlines():
+                self.log_panel.write(f"[dim]{line}[/]")
+        except Exception:
+            pass
 
     def _handle(self, kind: str, *payload):
-        if kind == "status":
-            self._set_status(payload[0])
-            self._touch()
-        elif kind == "log":
-            line = payload[0]
-            if line.startswith("[TTS") or line.startswith("[Twitch"):
-                self.log_panel.write(f"[dim]{line}[/]")
-            elif line.startswith("[Idle") or line.startswith("[Random"):
-                self.log_panel.write(f"[yellow]{line}[/]")
-            elif "Error" in line or "Traceback" in line or line.startswith("Traceback"):
-                self.log_panel.write(f"[bold red]{line}[/]")
-            else:
-                self.log_panel.write(line)
-        elif kind == "transcript":
-            source, text = payload
-            self.transcript_log.write(f"[bold #7fd8a4]You ({source}):[/] {text}")
-            self._touch()
-        elif kind == "turn":
-            user_text, bot_text = payload
-            self.history_log.write(f"[bold #ffa657]You:[/] {user_text}")
-            self.history_log.write(f"[bold #7fb4ff]Bot:[/] {bot_text}")
-            self._touch()
-        elif kind == "turn_start":
-            self._touch()
-        elif kind == "activity":
-            self._touch()
-        elif kind == "error":
-            self.log_panel.write(f"[bold red]{payload[0]}[/]")
+        try:
+            if kind == "status":
+                self._set_status(payload[0])
+                self._touch()
+            elif kind == "log":
+                line = payload[0]
+                if line.startswith("[TTS") or line.startswith("[Twitch"):
+                    self.log_panel.write(f"[dim]{line}[/]")
+                elif line.startswith("[Idle") or line.startswith("[Random"):
+                    self.log_panel.write(f"[yellow]{line}[/]")
+                elif "Error" in line or "Traceback" in line or line.startswith("Traceback"):
+                    self.log_panel.write(f"[bold red]{line}[/]")
+                else:
+                    self.log_panel.write(line)
+            elif kind == "transcript":
+                source, text = payload
+                self.transcript_log.write(f"[bold #7fd8a4]You ({source}):[/] {text}")
+                self._touch()
+            elif kind == "turn":
+                user_text, bot_text = payload
+                self.history_log.write(f"[bold #ffa657]You:[/] {user_text}")
+                self.history_log.write(f"[bold #7fb4ff]Bot:[/] {bot_text}")
+                self._touch()
+            elif kind == "turn_start":
+                self._touch()
+            elif kind == "activity":
+                self._touch()
+            elif kind == "error":
+                self.log_panel.write(f"[bold red]{payload[0]}[/]")
+        except Exception as e:
+            self._log_tui_error("event handler", e)
 
     def _update_idle(self):
-        if self.status == "LISTENING":
-            remaining = max(0.0, settings.MAX_IDLE_TIME - (time.time() - self.last_activity))
-            self.idle_count.update(f"[bold]{remaining:5.1f}s[/] until idle trigger")
-            self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
-        else:
-            self.idle_count.update(f"in turn: {self.status}")
-            self.idle_bar.update(progress=settings.MAX_IDLE_TIME, total=settings.MAX_IDLE_TIME)
-        self.last_activity_label.update(
-            f"Last activity: {time.strftime('%H:%M:%S', time.localtime(self.last_activity))}"
-        )
+        try:
+            if self.status == "LISTENING":
+                remaining = max(0.0, settings.MAX_IDLE_TIME - (time.time() - self.last_activity))
+                self.idle_count.update(f"[bold]{remaining:5.1f}s[/] until idle trigger")
+                self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
+            else:
+                self.idle_count.update(f"in turn: {self.status}")
+                self.idle_bar.update(progress=settings.MAX_IDLE_TIME, total=settings.MAX_IDLE_TIME)
+            self.last_activity_label.update(
+                f"Last activity: {time.strftime('%H:%M:%S', time.localtime(self.last_activity))}"
+            )
+        except Exception as e:
+            self._log_tui_error("idle panel", e)
 
     def _update_twitch(self):
         events = twitch_collector.snapshot(max_size=200)
