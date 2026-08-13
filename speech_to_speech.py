@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import traceback
+from typing import cast
 import numpy as np
 import requests
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
@@ -43,6 +44,10 @@ _event_queue: queue.Queue = queue.Queue()
 # TUI -> pipeline thread: typed text to send to the bot
 text_input_queue: queue.Queue = queue.Queue()
 shutdown_event = threading.Event()
+# slash-command signals (TUI -> pipeline): /stop, /pause, /now
+interrupt_event = threading.Event()
+pause_event = threading.Event()
+now_event = threading.Event()
 
 timing_info: dict[str, float | None] = {
     "vad_start": None,
@@ -185,6 +190,7 @@ def process_input(
     messages.append({"role": "user", "content": user_input})
     emit("status", "THINKING")
     emit("turn_start", user_input)
+    interrupt_event.clear()
     start_time = time.time()
     audio_queue: AudioGenerationQueue | None = None
     interrupted = False
@@ -219,6 +225,9 @@ def process_input(
         playback_thread.start()
 
         for chunk in response_stream:
+            if interrupt_event.is_set():
+                emit("log", "[Command] Stop: stream aborted.")
+                break
             data = parse_stream_chunk(chunk)
             if not data or "choices" not in data:
                 continue
@@ -286,6 +295,16 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
 
     try:
         while True:
+            if interrupt_event.is_set():
+                interrupt_event.clear()
+                emit("log", "[Command] Stop: playback interrupted, clearing queues.")
+                audio_queue.clear_queues()
+                break
+            if pause_event.is_set():
+                audio_queue.clear_queues()
+                time.sleep(settings.PLAYBACK_DELAY)
+                continue
+
             if audio_queue.audio_queue.empty():
                 speech_detected, audio_data = check_for_speech()
                 if speech_detected:
@@ -304,10 +323,18 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                 emit("bot_spoken", sentence)
                 if settings.LOG_TTS_CHUNKS:
                     emit("log", f"[TTS Playing] {sentence!r}")
-                was_interrupted, interrupt_data = play_audio_with_interrupt(audio_data)
+                was_interrupted, interrupt_data = play_audio_with_interrupt(
+                    audio_data, stop_events=[interrupt_event, pause_event]
+                )
                 if was_interrupted:
                     interrupt_audio = interrupt_data
-                    emit("log", "[TTS Interrupted] Interrupted during playback! Clearing audio queues...")
+                    if pause_event.is_set():
+                        emit("log", "[Command] Pause: playback suspended.")
+                    elif interrupt_event.is_set():
+                        interrupt_event.clear()
+                        emit("log", "[Command] Stop: playback interrupted, clearing queues.")
+                    else:
+                        emit("log", "[TTS Interrupted] Interrupted during playback! Clearing audio queues...")
                     audio_queue.clear_queues()
                     break
             else:
@@ -373,8 +400,22 @@ def pipeline_main():
         emit("status", "LISTENING")
         emit("log", "=== Ready. Speaking to me (or type below) triggers a response. ===")
         last_activity_time = time.time()
+        was_paused = False
 
         while not shutdown_event.is_set():
+            if pause_event.is_set():
+                if not was_paused:
+                    emit("status", "PAUSED")
+                    emit("log", "[Command] Paused: voice and idle countdown suspended. /play to resume.")
+                was_paused = True
+                time.sleep(0.1)
+                continue
+            if was_paused:
+                was_paused = False
+                last_activity_time = time.time()
+                emit("status", "LISTENING")
+                emit("log", "[Command] Resumed.")
+
             try:
                 text = text_input_queue.get_nowait()
             except queue.Empty:
@@ -440,8 +481,12 @@ def pipeline_main():
                     emit("log", "No clear speech detected, please try again.")
             else:
                 # Check idle condition if no voice input was detected
+                if interrupt_event.is_set():
+                    interrupt_event.clear()
+                    emit("log", "[Command] Stop: nothing in progress.")
                 idle_elapsed = time.time() - last_activity_time
-                if idle_elapsed >= settings.MAX_IDLE_TIME:
+                if idle_elapsed >= settings.MAX_IDLE_TIME or now_event.is_set():
+                    now_event.clear()
                     emit("status", "IDLE")
                     emit("log", f"[Idle Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
 
@@ -506,22 +551,68 @@ def print_timing_chart(metrics):
         prev_time = t
 
 
+# Slash commands: name -> (handler method, description). Drives both the
+# completion menu and the /help panel.
+SLASH_COMMANDS = [
+    ("/quit", "Quit the application (asks for confirmation)"),
+    ("/clear", "Clear the chat display"),
+    ("/stop", "Interrupt the current playback / response"),
+    ("/now", "Trigger the idle event immediately"),
+    ("/pause", "Suspend voice output and the idle countdown"),
+    ("/play", "Resume from pause"),
+    ("/help", "Show this list of slash commands"),
+]
+
+
 class ChatInput(Input):
-    """Text input that sends lines to the pipeline thread."""
+    """Text input that sends lines to the pipeline thread, with slash-command
+    support: typing / shows a completion menu (Tab/arrows/Enter like opencode)."""
 
     BINDINGS = [
         Binding("escape", "unfocus", "Unfocus input"),
+        Binding("up", "suggestion(-1)", "Previous command", show=False),
+        Binding("down", "suggestion(1)", "Next command", show=False),
+        Binding("tab", "accept_suggestion", "Accept command", show=False),
     ]
 
+    def on_mount(self):
+        self._suggestion_matches: list = []
+        self._suggestion_index = 0
+
     def action_unfocus(self):
+        self._hide_suggestions()
         try:
             self.screen.set_focus(None)
         except Exception as e:
             emit("error", f"unfocus error: {type(e).__name__}: {e}")
 
+    def on_input_changed(self, event: Input.Changed):
+        value = event.value
+        if value.startswith("/") and " " not in value:
+            prefix = value[1:].lower()
+            self._suggestion_matches = [
+                c for c in SLASH_COMMANDS if c[0].startswith("/" + prefix)
+            ]
+            self._suggestion_index = 0
+            self._render_suggestions()
+        else:
+            self._hide_suggestions()
+
     def on_input_submitted(self, event: Input.Submitted):
         try:
+            if self._suggestion_matches:
+                cast("SpeechTUI", self.app)._run_command(
+                    self._suggestion_matches[self._suggestion_index][0]
+                )
+                self.value = ""
+                self._hide_suggestions()
+                return
             text = event.value.strip()
+            if text.startswith("/"):
+                cast("SpeechTUI", self.app)._run_command(text)
+                self.value = ""
+                self._hide_suggestions()
+                return
             if text:
                 text_input_queue.put(text)
                 emit("activity")
@@ -530,6 +621,50 @@ class ChatInput(Input):
         except Exception as e:
             # never raise out of a message handler (Textual would panic the app)
             emit("error", f"text input error: {type(e).__name__}: {e}")
+
+    def action_suggestion(self, delta: int):
+        if self._suggestion_matches:
+            self._suggestion_index = (
+                self._suggestion_index + delta
+            ) % len(self._suggestion_matches)
+            self._render_suggestions()
+        elif delta < 0:
+            self.action_home()
+        else:
+            self.action_end()
+
+    def action_accept_suggestion(self):
+        if self._suggestion_matches:
+            name = self._suggestion_matches[self._suggestion_index][0]
+            self.value = name
+            self.cursor_position = len(name)
+        else:
+            self.app.action_focus_next()
+
+    def _suggestions_widget(self):
+        return self.app.query_one("#cmd-suggestions", Static)
+
+    def _render_suggestions(self):
+        matches = self._suggestion_matches
+        if not matches:
+            self._hide_suggestions()
+            return
+        t = Text()
+        for i, (name, desc) in enumerate(matches):
+            selected = i == self._suggestion_index
+            t.append(f"  {name:<8}", style="bold reverse" if selected else "")
+            t.append(f"  {desc}", style="" if selected else "dim")
+            if i < len(matches) - 1:
+                t.append("\n")
+        self._suggestions_widget().update(t)
+        self._suggestions_widget().styles.display = "block"
+
+    def _hide_suggestions(self):
+        self._suggestion_matches = []
+        try:
+            self._suggestions_widget().styles.display = "none"
+        except Exception:
+            pass
 
 
 class QuitConfirm(Screen):
@@ -571,6 +706,42 @@ class QuitConfirm(Screen):
     @on(Button.Pressed, "#quit-yes")
     def _quit(self):
         self.app.exit()
+
+
+class HelpScreen(Screen):
+    """Modal panel listing the available slash commands."""
+
+    CSS = """
+    HelpScreen { align: center middle; }
+    #help-dialog {
+        width: 62;
+        height: auto;
+        padding: 1 2;
+        border: round $accent;
+        background: $panel;
+    }
+    #help-title { text-style: bold; height: 1; }
+    #help-list { height: auto; margin-top: 1; }
+    #help-list Static { height: 1; }
+    #help-hint { color: $text-muted; height: 1; margin-top: 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Dismiss"),
+        Binding("q", "close", "Dismiss"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-dialog"):
+            yield Static("Slash Commands", id="help-title")
+            with Vertical(id="help-list"):
+                for name, desc in SLASH_COMMANDS:
+                    yield Static(f"[bold #7fb4ff]{name:<8}[/]  {desc}")
+            yield Static("Press Escape or q to close.", id="help-hint")
+        yield Footer()
+
+    def action_close(self):
+        self.app.pop_screen()
 
 
 # mIRC's classic per-nick color palette (hex for the 16-color table).
@@ -631,6 +802,15 @@ class SpeechTUI(App):
     #last-activity { color: $text-muted; height: 1; }
     #status-bar { dock: bottom; height: 1; color: $text; background: $panel; padding: 0 1; }
     #text-input { dock: bottom; height: 3; }
+    #cmd-suggestions {
+        display: none;
+        height: auto;
+        max-height: 6;
+        padding: 0 1;
+        background: $panel;
+        border: round $accent;
+        margin: 0 1 1 1;
+    }
     """
 
     _STATUS_COLORS = {
@@ -640,6 +820,7 @@ class SpeechTUI(App):
         "THINKING": "magenta",
         "SPEAKING": "blue",
         "IDLE": "red",
+        "PAUSED": "grey",
     }
 
     def __init__(self):
@@ -672,7 +853,8 @@ class SpeechTUI(App):
                         yield Label(id="idle-count")
                         yield Label(id="last-activity")
             yield Static(id="status-bar")
-            yield ChatInput(id="text-input", placeholder="Type a message for the bot, Enter to send. Quit via the System menu...")
+            yield Static(id="cmd-suggestions")
+            yield ChatInput(id="text-input", placeholder="Type a message for the bot, or / for commands. Enter to send.")
         yield Footer()
 
     def _rich_log(self, widget_id, title, max_lines=200, wrap=False):
@@ -711,6 +893,60 @@ class SpeechTUI(App):
         self.query_one("#system-menu").remove_class("-open")
         self.push_screen(QuitConfirm())
 
+    # ---- slash commands ----
+
+    def _run_command(self, raw: str):
+        try:
+            name = raw.strip().split()[0].lower()
+            handler = {
+                "/quit": self._cmd_quit,
+                "/clear": self._cmd_clear,
+                "/stop": self._cmd_stop,
+                "/now": self._cmd_now,
+                "/pause": self._cmd_pause,
+                "/play": self._cmd_play,
+                "/help": self._cmd_help,
+            }.get(name)
+            if handler:
+                handler()
+            else:
+                self._notice(f"Unknown command: {raw}", color="bold red")
+        except Exception as e:
+            self._log_tui_error("command", e)
+
+    def _cmd_quit(self):
+        self.query_one("#system-menu").remove_class("-open")
+        self.push_screen(QuitConfirm())
+
+    def _cmd_clear(self):
+        self.chat.remove_children()
+        self._reset_live()
+        self._notice_seen = set()
+        self._bot_reply("Chat cleared.")
+
+    def _cmd_stop(self):
+        interrupt_event.set()
+        self._bot_reply("Stopped. I've silenced my output.")
+
+    def _cmd_now(self):
+        now_event.set()
+        self._bot_reply("Idle countdown set to zero — I'll start talking now.")
+
+    def _cmd_pause(self):
+        pause_event.set()
+        self._set_status("PAUSED")
+        self._bot_reply("Paused. My voice and the idle countdown are suspended. Type /play to resume.")
+
+    def _cmd_play(self):
+        if pause_event.is_set():
+            pause_event.clear()
+            self._bot_reply("Resumed. I'm listening again.")
+        else:
+            self._bot_reply("I wasn't paused.")
+
+    def _cmd_help(self):
+        self.push_screen(HelpScreen())
+
     # ---- main chat window ----
 
     def _chat_line(self, renderable, classes=""):
@@ -726,6 +962,13 @@ class SpeechTUI(App):
         t.append("*** ", style="bold cyan")
         t.append(text, style=color)
         return self._chat_line(t, classes="notice")
+
+    def _bot_reply(self, text: str):
+        """Bot's own chat line, e.g. an acknowledgment to a slash command."""
+        t = Text()
+        t.append("Bot: ", style="bold #7fb4ff")
+        t.append(text)
+        return self._chat_line(t)
 
     def _clear_notices(self):
         for w in list(self.chat.query(".notice")):

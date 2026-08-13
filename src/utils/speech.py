@@ -322,16 +322,18 @@ def check_for_speech(timeout=0.1):
     return False, None
 
 
-def play_audio_with_interrupt(audio_data, sample_rate=24000):
+def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None):
     """Plays audio while monitoring for speech interruption.
 
     Args:
         audio_data (np.ndarray): Audio data to play.
         sample_rate (int, optional): Sample rate for playback. Defaults to 24000.
+        stop_events (list, optional): threading.Events that abort playback (like interruption).
 
     Returns:
         tuple: A tuple containing a boolean indicating if playback was interrupted and None, or (False, None) if playback completes without interruption.
     """
+    stop_events = stop_events or []
     interrupt_queue = Queue()
     position = [0]
 
@@ -352,7 +354,7 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
             print(f"Output status: {status}")
             return
 
-        if not interrupt_queue.empty():
+        if not interrupt_queue.empty() or any(e.is_set() for e in stop_events):
             raise sd.CallbackStop()
 
         remaining = len(audio_data) - position[0]
@@ -375,7 +377,7 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
             ):
                 while position[0] < len(audio_data):
                     sd.sleep(50)
-                    if not interrupt_queue.empty():
+                    if not interrupt_queue.empty() or any(e.is_set() for e in stop_events):
                         return True, None
         
         is_interrupted = not interrupt_queue.empty()
