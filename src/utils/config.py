@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     MAX_TOKENS: int = Field(default=512)
     LLM_TEMPERATURE: float = Field(default=0.7)
 
+    QDRANT_HOST: Optional[str] = Field(default="")
+    QDRANT_COLLECTION: str = Field(default="conversation_memory")
+    EMBEDDING_MODEL: str = Field(default="text-embedding-nomic-embed-text-v1.5")
+
     WHISPER_MODEL_ID: str = Field(default="openai/whisper-tiny.en")
     WHISPER_MODEL_DIR: str = Field(default="data/models/whisper-tiny.en")
 

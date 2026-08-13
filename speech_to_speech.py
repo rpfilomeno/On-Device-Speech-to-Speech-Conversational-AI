@@ -27,6 +27,7 @@ from src.utils import (
 )
 from src.utils.audio_queue import AudioGenerationQueue
 from src.utils.llm import parse_stream_chunk
+from src.utils.memory import Memory, MemoryWorker, RamMemory
 from src.utils.text_chunker import TextChunker
 
 from rich.text import Text
@@ -170,6 +171,7 @@ def process_input(
     messages: list,
     generator: VoiceGenerator,
     speed: float,
+    memory: MemoryWorker | None = None,
 ) -> tuple[bool, np.ndarray | None]:
     """Processes user input, generates a response, and handles audio output.
 
@@ -179,6 +181,7 @@ def process_input(
         messages (list): The list of messages to send to the LLM.
         generator (VoiceGenerator): The voice generator object.
         speed (float): The playback speed.
+        memory (Memory, optional): Long-term vector memory to recall from / write to.
 
     Returns:
         tuple[bool, None]: A tuple containing a boolean indicating if the process was interrupted and None.
@@ -189,6 +192,23 @@ def process_input(
 
     messages.append({"role": "user", "content": user_input})
     emit("status", "THINKING")
+
+    llm_messages = messages
+    if memory is not None:
+        try:
+            recalled = memory.search(user_input)
+            if recalled:
+                memory_block = "\n".join(f"- {m}" for m in recalled)
+                llm_messages = list(messages)
+                llm_messages[0] = {
+                    "role": "system",
+                    "content": messages[0]["content"]
+                    + "\n\nRelevant memories from past conversations:\n"
+                    + memory_block,
+                }
+        except Exception as e:
+            emit("log", f"Memory recall failed: {e}")
+
     emit("turn_start", user_input)
     interrupt_event.clear()
     start_time = time.time()
@@ -198,7 +218,7 @@ def process_input(
     try:
         response_stream = get_ai_response(
             session=session,
-            messages=messages,
+            messages=llm_messages,
             llm_model=settings.LLM_MODEL,
             llm_url=settings.LM_STUDIO_URL,
             max_tokens=settings.MAX_TOKENS,
@@ -270,6 +290,12 @@ def process_input(
         print_timing_chart(timing_info)
         if bot_text:
             emit("turn", user_input, bot_text)
+        if memory is not None and bot_text:
+            try:
+                memory.store("user", user_input)
+                memory.store("assistant", bot_text)
+            except Exception as e:
+                emit("log", f"Memory store failed: {e}")
         emit("status", "LISTENING")
         return interrupted, interrupt_data
 
@@ -376,6 +402,25 @@ def pipeline_main():
         session = requests.Session()
         messages = [{"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT}]
 
+        memory = None
+        try:
+            if not settings.QDRANT_HOST:
+                raise RuntimeError("QDRANT_HOST not set")
+            backend = Memory(
+                settings.QDRANT_HOST,
+                settings.LM_STUDIO_URL,
+                settings.EMBEDDING_MODEL,
+                collection=settings.QDRANT_COLLECTION,
+            )
+            backend.check()
+            emit("log", f"Long-term memory: Qdrant ({settings.QDRANT_HOST}, collection '{settings.QDRANT_COLLECTION}')")
+        except Exception as e:
+            backend = RamMemory(settings.LM_STUDIO_URL, settings.EMBEDDING_MODEL)
+            emit("log", f"Long-term memory: Qdrant unavailable ({e}) — using RAM-only memory.")
+        if backend is not None:
+            memory = MemoryWorker(backend)
+            emit("log", "Long-term memory: embedding work runs on a background thread.")
+
         if settings.TWITCH_CLIENT_CHANNEL:
             emit("log", f"Starting Twitch chat collector for channel: {settings.TWITCH_CLIENT_CHANNEL}...")
             twitch_bot_manager.start(settings.TWITCH_CLIENT_CHANNEL)
@@ -424,7 +469,7 @@ def pipeline_main():
 
             if text is not None:
                 last_activity_time = time.time()
-                process_input(session, text, messages, generator, speed)
+                process_input(session, text, messages, generator, speed, memory=memory)
                 last_activity_time = time.time()
                 continue
 
@@ -448,7 +493,7 @@ def pipeline_main():
                     if user_input.strip():
                         emit("transcript", "voice", user_input)
                         was_interrupted, speech_data = process_input(
-                            session, user_input, messages, generator, speed
+                            session, user_input, messages, generator, speed, memory=memory
                         )
                         last_activity_time = time.time()
                         emit("activity")
@@ -473,6 +518,7 @@ def pipeline_main():
                                         messages,
                                         generator,
                                         speed,
+                                        memory=memory,
                                     )
                                     last_activity_time = time.time()
                                     emit("activity")
@@ -510,7 +556,7 @@ def pipeline_main():
                         emit("log", f"[Random Idle Event] Picked prompt: '{prompt_text}'")
                         emit("transcript", "idle", prompt_text)
 
-                    process_input(session, prompt_text, messages, generator, speed)
+                    process_input(session, prompt_text, messages, generator, speed, memory=memory)
                     last_activity_time = time.time()
                     emit("activity")
 
