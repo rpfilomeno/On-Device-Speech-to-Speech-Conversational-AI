@@ -5,7 +5,7 @@ Real-time local speech-to-speech chatbot: VAD → Whisper → LLM (Ollama/LM Stu
 ## Commands
 
 - Setup: `uv sync` (source of truth is `pyproject.toml`; `requirements.txt` is a stale fallback). Copy `.env.template` → `.env` and fill in `HUGGINGFACE_TOKEN`.
-- Run: `uv run speech_to_speech.py` (Textual TUI; `q` quits, `t` focuses the text input, Esc unfocuses it, Ctrl+Q quits from the input). Or `uv run text_to_speech.py` (single-turn TTS demo). `hello.py` is the `uv init` scaffold — ignore it.
+- Run: `uv run speech_to_speech.py` (Textual TUI; `t` focuses the text input, Esc unfocuses it. Quitting is menu-only: top menu bar `System` → `(Q)uit` → confirm dialog. `q`/`Ctrl+Q` do NOT quit.) Or `uv run text_to_speech.py` (single-turn TTS demo). `hello.py` is the `uv init` scaffold — ignore it.
 - No tests, linters, typecheckers, or CI exist. `tests/` is empty. Don't assume pytest is configured.
 
 ## Runtime requirements (not in code)

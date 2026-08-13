@@ -117,7 +117,7 @@ def get_ai_response(
         print(f"\nError: {str(e)}")
 
 
-def parse_stream_chunk(chunk: bytes) -> dict:
+def parse_stream_chunk(chunk: bytes) -> dict | None:
     """Parses a chunk of data from the LLM stream.
 
     Args:

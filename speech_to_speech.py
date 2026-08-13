@@ -1,10 +1,12 @@
 import logging
 import random
 import queue
+import re
 import sys
 import threading
 import time
 import traceback
+import numpy as np
 import requests
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
@@ -26,10 +28,13 @@ from src.utils.audio_queue import AudioGenerationQueue
 from src.utils.llm import parse_stream_chunk
 from src.utils.text_chunker import TextChunker
 
+from rich.text import Text
+from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, Input, Label, ProgressBar, RichLog
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen
+from textual.widgets import Button, Footer, Header, Input, Label, ProgressBar, RichLog, Static
 
 settings.setup_directories()
 
@@ -39,7 +44,7 @@ _event_queue: queue.Queue = queue.Queue()
 text_input_queue: queue.Queue = queue.Queue()
 shutdown_event = threading.Event()
 
-timing_info = {
+timing_info: dict[str, float | None] = {
     "vad_start": None,
     "transcription_start": None,
     "llm_first_token": None,
@@ -63,10 +68,11 @@ class _LogStream:
 
     def __init__(self):
         self._buf = ""
-        self._last_flush = 0.0
 
     def write(self, text: str):
-        # never raise / never touch the real terminal: any bad write is dropped
+        # never raise / never touch the real terminal: any bad write is dropped.
+        # Only complete (newline-terminated) lines are emitted -- partial lines
+        # stay buffered so they can never be emitted twice.
         try:
             # keep only the tail after the last \r so tqdm progress bars collapse
             # into their final line instead of spamming the log panel
@@ -78,11 +84,6 @@ class _LogStream:
                 line = line.strip()
                 if line:
                     emit("log", line)
-            # show long partial lines (e.g. LLM token streaming) roughly twice a second
-            now = time.time()
-            if self._buf.strip() and now - self._last_flush >= 0.5:
-                self._last_flush = now
-                emit("log", self._buf.strip())
         except Exception:
             pass
 
@@ -90,7 +91,7 @@ class _LogStream:
         try:
             if self._buf.strip():
                 emit("log", self._buf.strip())
-                self._buf = ""
+            self._buf = ""
         except Exception:
             pass
 
@@ -164,7 +165,7 @@ def process_input(
     messages: list,
     generator: VoiceGenerator,
     speed: float,
-) -> tuple[bool, None]:
+) -> tuple[bool, np.ndarray | None]:
     """Processes user input, generates a response, and handles audio output.
 
     Args:
@@ -185,6 +186,9 @@ def process_input(
     emit("status", "THINKING")
     emit("turn_start", user_input)
     start_time = time.time()
+    audio_queue: AudioGenerationQueue | None = None
+    interrupted = False
+    interrupt_data: np.ndarray | None = None
     try:
         response_stream = get_ai_response(
             session=session,
@@ -204,12 +208,11 @@ def process_input(
         chunker = TextChunker()
         complete_response = []
 
-        playback_result = {"interrupted": False, "data": None}
-
         def worker_runner():
+            nonlocal interrupted, interrupt_data
             was_int, int_data = audio_playback_worker(audio_queue)
-            playback_result["interrupted"] = was_int
-            playback_result["data"] = int_data
+            interrupted = was_int
+            interrupt_data = int_data
 
         playback_thread = threading.Thread(target=worker_runner)
         playback_thread.daemon = True
@@ -226,7 +229,7 @@ def process_input(
                 if content:
                     if not timing_info["llm_first_token"]:
                         timing_info["llm_first_token"] = time.perf_counter()
-                    print(content, end="", flush=True)
+                    emit("bot_token", content)
                     chunker.current_text.append(content)
 
                     text = "".join(chunker.current_text)
@@ -246,7 +249,9 @@ def process_input(
         if final_flushed:
             complete_response.append(final_flushed)
 
-        messages.append({"role": "assistant", "content": " ".join(complete_response).strip()})
+        # collapse runs of whitespace left by raw streamed tokens
+        bot_text = " ".join(" ".join(complete_response).split())
+        messages.append({"role": "assistant", "content": bot_text})
         print()
 
         audio_queue.stop()
@@ -254,20 +259,19 @@ def process_input(
 
         timing_info["end"] = time.perf_counter()
         print_timing_chart(timing_info)
-        bot_text = " ".join(complete_response).strip()
         if bot_text:
             emit("turn", user_input, bot_text)
         emit("status", "LISTENING")
-        return playback_result["interrupted"], playback_result["data"]
+        return interrupted, interrupt_data
 
     except Exception as e:
         emit("log", f"Error during streaming: {str(e)}")
-        if "audio_queue" in locals():
+        if audio_queue is not None:
             audio_queue.stop()
         return False, None
 
 
-def audio_playback_worker(audio_queue) -> tuple[bool, None]:
+def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     """Manages audio playback in a separate thread, handling interruptions.
 
     Args:
@@ -297,6 +301,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, None]:
                     timing_info["first_audio_play"] = time.perf_counter()
                     emit("status", "SPEAKING")
 
+                emit("bot_spoken", sentence)
                 if settings.LOG_TTS_CHUNKS:
                     emit("log", f"[TTS Playing] {sentence!r}")
                 was_interrupted, interrupt_data = play_audio_with_interrupt(audio_data)
@@ -452,10 +457,12 @@ def pipeline_main():
                             TWITCH_CHATS_AND_EVENTS=events_summary
                         )
                         emit("log", f"[Twitch Idle Event] Responding to {len(twitch_events)} collected Twitch event(s)...")
+                        emit("transcript", "idle", prompt_text)
                     else:
                         idle_prompts = settings.get_idle_prompts_list()
                         prompt_text = random.choice(idle_prompts)
                         emit("log", f"[Random Idle Event] Picked prompt: '{prompt_text}'")
+                        emit("transcript", "idle", prompt_text)
 
                     process_input(session, prompt_text, messages, generator, speed)
                     last_activity_time = time.time()
@@ -504,7 +511,6 @@ class ChatInput(Input):
 
     BINDINGS = [
         Binding("escape", "unfocus", "Unfocus input"),
-        Binding("ctrl+q", "exit_app", "Quit"),
     ]
 
     def action_unfocus(self):
@@ -512,9 +518,6 @@ class ChatInput(Input):
             self.screen.set_focus(None)
         except Exception as e:
             emit("error", f"unfocus error: {type(e).__name__}: {e}")
-
-    def action_exit_app(self):
-        self.app.exit()
 
     def on_input_submitted(self, event: Input.Submitted):
         try:
@@ -529,75 +532,166 @@ class ChatInput(Input):
             emit("error", f"text input error: {type(e).__name__}: {e}")
 
 
+class QuitConfirm(Screen):
+    """Confirmation dialog shown before the app finally exits."""
+
+    CSS = """
+    QuitConfirm { align: center middle; }
+    #quit-dialog {
+        width: 52;
+        height: auto;
+        padding: 1 2;
+        border: round $error;
+        background: $panel;
+    }
+    #quit-dialog Static { height: 1; }
+    #dialog-buttons { height: 3; align-horizontal: center; margin-top: 1; }
+    #dialog-buttons Button { width: 16; margin: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quit-dialog"):
+            yield Static("Are you sure you want to quit?", classes="dialog-title")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Cancel", id="quit-cancel")
+                yield Button("Quit", id="quit-yes", variant="error")
+        yield Footer()
+
+    def action_cancel(self):
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#quit-cancel")
+    def _cancel(self):
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#quit-yes")
+    def _quit(self):
+        self.app.exit()
+
+
+# mIRC's classic per-nick color palette (hex for the 16-color table).
+_IRC_NICK_COLORS = [
+    "#FF0000",  # red
+    "#0000FC",  # light blue
+    "#00FC00",  # bright green
+    "#FC7F00",  # orange
+    "#009300",  # green
+    "#FFFF00",  # yellow
+    "#FF00FF",  # pink
+    "#9C009C",  # purple
+    "#7F0000",  # maroon
+    "#00FFFF",  # aqua
+    "#009393",  # teal
+    "#7F7F7F",  # grey
+    "#00007F",  # blue
+]
+
+
+def _irc_nick_color(nick: str) -> str:
+    """Deterministically assign an mIRC nick color so each user keeps theirs."""
+    return _IRC_NICK_COLORS[sum(ord(c) for c in nick) % len(_IRC_NICK_COLORS)]
+
+
 class SpeechTUI(App):
     TITLE = "On-Device Speech-to-Speech AI"
 
     BINDINGS = [
-        Binding("q", "exit_app", "Quit"),
         Binding("t", "focus_input", "Text input"),
     ]
 
     CSS = """
+    #menu-bar { dock: top; height: auto; background: $panel; }
+    #menu-row { height: 1; }
+    #menu-system { height: 1; min-width: 10; }
+    .menu-title { height: 1; color: $text-muted; padding: 0 1; }
+    #system-menu { display: none; height: auto; border: round $accent; background: $panel; }
+    #system-menu.-open { display: block; }
+    #system-quit { width: 20; height: 1; }
     #main { height: 1fr; }
-    #row1 { height: 2fr; }
-    #row2 { height: 2fr; }
-    #idle-panel, #twitch-log, #transcript-log, #history-log {
-        width: 1fr;
+    #middle { height: 1fr; }
+    #chat-scroll {
+        width: 3fr;
         border: round $accent;
+        overflow-x: hidden;
     }
-    #log { height: 3fr; border: round $primary; }
-    #state-label { height: 1; text-style: bold; padding: 0 1; }
-    #idle-count { height: 1; padding: 0 1; }
-    #last-activity { height: 1; color: $text-muted; padding: 0 1; }
+    #chat-scroll > Static {
+        width: 100%;
+        text-wrap: wrap;
+    }
+    #right { width: 1fr; }
+    #twitch-log { height: 2fr; border: round $accent; }
+    #idle-pane { height: 1fr; border: round $accent; }
+    #idle-pane Label { padding: 0 1; }
+    #status-text { text-style: bold; height: 1; }
     #idle-bar { height: 1; margin: 0 1 1 1; }
-    #idle-tip { height: 2; color: $text-muted; padding: 0 1; }
-    #text-input { height: 3; }
+    #last-activity { color: $text-muted; height: 1; }
+    #status-bar { dock: bottom; height: 1; color: $text; background: $panel; padding: 0 1; }
+    #text-input { dock: bottom; height: 3; }
     """
+
+    _STATUS_COLORS = {
+        "INITIALIZING": "cyan",
+        "LISTENING": "green",
+        "TRANSCRIBING": "yellow",
+        "THINKING": "magenta",
+        "SPEAKING": "blue",
+        "IDLE": "red",
+    }
 
     def __init__(self):
         super().__init__()
         self.status = "STARTING"
         self.last_activity = time.time()
         self.twitch_cache = None
+        self._twitch_count = 0
+        self._live_static = None
+        self._stream_buf = ""
+        self._spoken_buf = ""
+        self._notice_seen = set()
 
     def compose(self) -> ComposeResult:
+        with Vertical(id="menu-bar"):
+            with Horizontal(id="menu-row"):
+                yield Button("System", id="menu-system")
+                yield Static("On-Device Speech-to-Speech AI", classes="menu-title")
+            with Vertical(id="system-menu"):
+                yield Button("(Q)uit", id="system-quit")
         yield Header(show_clock=True)
         with Vertical(id="main"):
-            with Horizontal(id="row1"):
-                with Vertical(id="idle-panel"):
-                    yield Label("STATUS / IDLE COUNTDOWN", id="state-label")
-                    yield Label(f"[bold]{self.status}[/]", id="status-text")
-                    yield ProgressBar(total=settings.MAX_IDLE_TIME, show_eta=False, show_percentage=False, id="idle-bar")
-                    yield Label(id="idle-count")
-                    yield Label(id="last-activity")
-                    yield Label(f"Idle trigger at MAX_IDLE_TIME={settings.MAX_IDLE_TIME:.0f}s of silence", id="idle-tip")
-                yield self._rich_log("twitch-log", "Twitch chat (pending)")
-            with Horizontal(id="row2"):
-                yield self._rich_log("transcript-log", "Transcriptions")
-                yield self._rich_log("history-log", "Conversation history")
-            yield self._rich_log("log", "Log", id="log", max_lines=2000)
-            yield ChatInput(id="text-input", placeholder="Type a message for the bot, Enter to send (Ctrl+Q quits)...")
+            with Horizontal(id="middle"):
+                yield VerticalScroll(id="chat-scroll")
+                with Vertical(id="right"):
+                    yield self._rich_log("twitch-log", "Twitch chat (pending)", wrap=True)
+                    with Vertical(id="idle-pane"):
+                        yield Label(id="status-text")
+                        yield ProgressBar(total=settings.MAX_IDLE_TIME, show_eta=False, show_percentage=False, id="idle-bar")
+                        yield Label(id="idle-count")
+                        yield Label(id="last-activity")
+            yield Static(id="status-bar")
+            yield ChatInput(id="text-input", placeholder="Type a message for the bot, Enter to send. Quit via the System menu...")
         yield Footer()
 
-    def _rich_log(self, widget_id, title, id=None, max_lines=200):
-        w = RichLog(id=id or widget_id, markup=True, max_lines=max_lines)
+    def _rich_log(self, widget_id, title, max_lines=200, wrap=False):
+        w = RichLog(id=widget_id, markup=True, max_lines=max_lines, wrap=wrap)
         w.border_title = title
         return w
 
     def on_mount(self):
-        self.state_label: Label = self.query_one("#state-label", Label)
+        self.chat: VerticalScroll = self.query_one("#chat-scroll", VerticalScroll)
+        self.twitch_log: RichLog = self.query_one("#twitch-log", RichLog)
+        self.status_bar: Static = self.query_one("#status-bar", Static)
         self.status_text: Label = self.query_one("#status-text", Label)
         self.idle_bar: ProgressBar = self.query_one("#idle-bar", ProgressBar)
         self.idle_count: Label = self.query_one("#idle-count", Label)
         self.last_activity_label: Label = self.query_one("#last-activity", Label)
-        self.twitch_log: RichLog = self.query_one("#twitch-log", RichLog)
-        self.transcript_log: RichLog = self.query_one("#transcript-log", RichLog)
-        self.history_log: RichLog = self.query_one("#history-log", RichLog)
-        self.log_panel: RichLog = self.query_one("#log", RichLog)
 
         _install_error_routing()
         self.set_interval(0.1, self._poll_events)
-        self.set_interval(0.25, self._update_idle)
+        self.set_interval(0.25, self._update_status)
         threading.Thread(target=pipeline_main, daemon=True).start()
         self._set_status("INITIALIZING")
 
@@ -608,24 +702,129 @@ class SpeechTUI(App):
     def action_focus_input(self):
         self.query_one("#text-input", Input).focus()
 
-    def action_exit_app(self):
-        self.exit()
+    @on(Button.Pressed, "#menu-system")
+    def _toggle_menu(self):
+        self.query_one("#system-menu").toggle_class("-open")
+
+    @on(Button.Pressed, "#system-quit")
+    def _open_quit_confirm(self):
+        self.query_one("#system-menu").remove_class("-open")
+        self.push_screen(QuitConfirm())
+
+    # ---- main chat window ----
+
+    def _chat_line(self, renderable, classes=""):
+        """Append a line to the main chat window and scroll to the bottom."""
+        line = Static(renderable, classes=classes)
+        self.chat.mount(line)
+        self.chat.scroll_end(animate=False)
+        return line
+
+    def _notice(self, text, color=""):
+        """mIRC-style notice line in the main window."""
+        t = Text()
+        t.append("*** ", style="bold cyan")
+        t.append(text, style=color)
+        return self._chat_line(t, classes="notice")
+
+    def _clear_notices(self):
+        for w in list(self.chat.query(".notice")):
+            w.remove()
+
+    def _reset_live(self):
+        self._live_static = None
+        self._stream_buf = ""
+        self._spoken_buf = ""
+
+    def _render_live(self):
+        """Re-render the streaming bot line: spoken words normal, the rest grey."""
+        if self._live_static is None:
+            self._live_static = self._chat_line("")
+        words = self._stream_buf.split()
+        spoken_count = len(self._spoken_buf.split())
+        spoken_part = " ".join(words[:spoken_count])
+        unspoken_part = " ".join(words[spoken_count:])
+        t = Text()
+        t.append("Bot: ", style="bold #7fb4ff")
+        if spoken_part:
+            t.append(spoken_part)
+            if unspoken_part:
+                t.append(" " + unspoken_part, style="dim")
+        elif unspoken_part:
+            t.append(unspoken_part, style="dim")
+        self._live_static.update(t)
+        self.chat.scroll_end(animate=False)
+
+    def _finalize_live(self, bot_text):
+        """Replace the streaming line with the completed response."""
+        if self._live_static is not None:
+            self._live_static.remove()
+            self._live_static = None
+        if bot_text:
+            bot_text = " ".join(bot_text.split())
+            t = Text()
+            t.append("Bot: ", style="bold #7fb4ff")
+            t.append(bot_text)
+            self._chat_line(t)
+
+    # ---- status footer ----
 
     def _set_status(self, status: str):
         self.status = status
-        colors = {
-            "INITIALIZING": "cyan",
-            "LISTENING": "green",
-            "TRANSCRIBING": "yellow",
-            "THINKING": "magenta",
-            "SPEAKING": "blue",
-            "IDLE": "red",
-        }
-        color = colors.get(status, "white")
-        self.status_text.update(f"[bold {color}]{status}[/]")
+        self._update_status()
 
     def _touch(self):
         self.last_activity = time.time()
+
+    def _timing_summary(self) -> str:
+        t = timing_info
+        if t["vad_start"] is None:
+            return ""
+        bits = []
+        if t["transcription_duration"]:
+            bits.append(f"trans {t['transcription_duration']:.1f}s")
+        if t["llm_first_token"]:
+            bits.append(f"llm {t['llm_first_token'] - t['vad_start']:.1f}s")
+        if t["first_audio_play"]:
+            bits.append(f"audio {t['first_audio_play'] - t['vad_start']:.1f}s")
+        if t["end"]:
+            bits.append(f"ttl {t['end'] - t['vad_start']:.1f}s")
+        return "  ".join(bits)
+
+    def _update_status(self):
+        try:
+            left = f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]"
+            if self.status == "LISTENING":
+                remaining = max(0.0, settings.MAX_IDLE_TIME - (time.time() - self.last_activity))
+                mid = f"idle [bold]{remaining:5.1f}s[/]"
+            else:
+                mid = f"in turn: {self.status}"
+            parts = [left, mid, f"twitch [bold]{self._twitch_count}[/] pending"]
+            timing = self._timing_summary()
+            if timing:
+                parts.append(timing)
+            self.status_bar.update("  │  ".join(parts))
+        except Exception as e:
+            self._log_tui_error("status bar", e)
+        self._update_idle_pane()
+
+    def _update_idle_pane(self):
+        try:
+            self.status_text.update(f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]")
+            if self.status == "LISTENING":
+                remaining = max(0.0, settings.MAX_IDLE_TIME - (time.time() - self.last_activity))
+                self.idle_count.update(f"idle in [bold]{remaining:5.1f}s[/]")
+                self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
+            else:
+                self.idle_count.update(f"in turn: {self.status}")
+                self.idle_bar.update(progress=settings.MAX_IDLE_TIME, total=settings.MAX_IDLE_TIME)
+            self.last_activity_label.update(
+                f"Last activity: {time.strftime('%H:%M:%S', time.localtime(self.last_activity))}"
+            )
+        except Exception as e:
+            self._log_tui_error("idle pane", e)
+
+    # ---- event handling ----
 
     def _poll_events(self):
         try:
@@ -640,12 +839,12 @@ class SpeechTUI(App):
             self._log_tui_error("twitch panel", e)
 
     def _log_tui_error(self, context: str, error: Exception):
-        """Write an exception to the log panel; must never raise (a raised
-        exception here would make Textual panic and tear down the TUI)."""
+        """Write an exception to the chat window as a notice; must never raise
+        (a raised exception here would make Textual panic and tear down the TUI)."""
         try:
-            self.log_panel.write(f"[bold red]{context}: {type(error).__name__}: {error}[/]")
+            self._notice(f"{context}: {type(error).__name__}: {error}", color="bold red")
             for line in traceback.format_exc().splitlines():
-                self.log_panel.write(f"[dim]{line}[/]")
+                self._notice(line, color="dim")
         except Exception:
             pass
 
@@ -655,55 +854,61 @@ class SpeechTUI(App):
                 self._set_status(payload[0])
                 self._touch()
             elif kind == "log":
-                line = payload[0]
-                if line.startswith("[TTS") or line.startswith("[Twitch"):
-                    self.log_panel.write(f"[dim]{line}[/]")
-                elif line.startswith("[Idle") or line.startswith("[Random"):
-                    self.log_panel.write(f"[yellow]{line}[/]")
-                elif "Error" in line or "Traceback" in line or line.startswith("Traceback"):
-                    self.log_panel.write(f"[bold red]{line}[/]")
-                else:
-                    self.log_panel.write(line)
+                self._log_notice(payload[0])
             elif kind == "transcript":
                 source, text = payload
-                self.transcript_log.write(f"[bold #7fd8a4]You ({source}):[/] {text}")
+                t = Text()
+                t.append(f"You ({source}): ", style="bold #7fd8a4")
+                t.append(text)
+                self._chat_line(t)
                 self._touch()
+            elif kind == "bot_token":
+                self._stream_buf += payload[0]
+                self._render_live()
+            elif kind == "bot_spoken":
+                self._spoken_buf = (self._spoken_buf + " " + payload[0]).strip()
+                self._render_live()
             elif kind == "turn":
-                user_text, bot_text = payload
-                self.history_log.write(f"[bold #ffa657]You:[/] {user_text}")
-                self.history_log.write(f"[bold #7fb4ff]Bot:[/] {bot_text}")
+                _, bot_text = payload
+                self._finalize_live(bot_text)
+                self._reset_live()
                 self._touch()
             elif kind == "turn_start":
+                self._clear_notices()
+                self._notice_seen = set()
+                self._finalize_live("")
+                self._reset_live()
                 self._touch()
             elif kind == "activity":
                 self._touch()
             elif kind == "error":
-                self.log_panel.write(f"[bold red]{payload[0]}[/]")
+                self._notice(payload[0], color="bold red")
         except Exception as e:
             self._log_tui_error("event handler", e)
 
-    def _update_idle(self):
-        try:
-            if self.status == "LISTENING":
-                remaining = max(0.0, settings.MAX_IDLE_TIME - (time.time() - self.last_activity))
-                self.idle_count.update(f"[bold]{remaining:5.1f}s[/] until idle trigger")
-                self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
-            else:
-                self.idle_count.update(f"in turn: {self.status}")
-                self.idle_bar.update(progress=settings.MAX_IDLE_TIME, total=settings.MAX_IDLE_TIME)
-            self.last_activity_label.update(
-                f"Last activity: {time.strftime('%H:%M:%S', time.localtime(self.last_activity))}"
-            )
-        except Exception as e:
-            self._log_tui_error("idle panel", e)
+    def _log_notice(self, line: str):
+        if line in self._notice_seen:
+            return
+        self._notice_seen.add(line)
+        if line.startswith("[TTS") or line.startswith("[Twitch"):
+            color = "dim"
+        elif line.startswith("[Idle") or line.startswith("[Random"):
+            color = "yellow"
+        elif "Error" in line or "Traceback" in line:
+            color = "bold red"
+        else:
+            color = ""
+        self._notice(line, color=color)
 
     def _update_twitch(self):
         events = twitch_collector.snapshot(max_size=200)
-        rendered = [
-            f"[{time.strftime('%H:%M:%S', time.localtime(e['timestamp']))}] {e['text']}"
-            for e in events
-        ]
-        key = "\n".join(rendered)
+        prev_count = self._twitch_count
+        self._twitch_count = len(events)
+        self.twitch_log.border_title = f"Twitch chat ({len(events)} pending)"
+        if self._twitch_count != prev_count:
+            self._update_status()
+        rendered = [self._twitch_line(e) for e in events]
+        key = repr(rendered)
         if key != self.twitch_cache:
             self.twitch_cache = key
             self.twitch_log.clear()
@@ -712,6 +917,20 @@ class SpeechTUI(App):
                     self.twitch_log.write(line)
             else:
                 self.twitch_log.write("[dim]No pending chat events[/]")
+
+    def _twitch_line(self, event: dict) -> Text:
+        """Build an mIRC-styled line: dim timestamp, per-nick colored name."""
+        t = Text()
+        t.append(f"[{time.strftime('%H:%M:%S', time.localtime(event['timestamp']))}] ", style="dim")
+        m = re.match(r"\[Chat\] (\S+): (.*)$", event["text"], re.S)
+        if m:
+            nick, message = m.groups()
+            color = _irc_nick_color(nick)
+            t.append(f"<{nick}> ", style=f"bold {color}")
+            t.append(message)
+        else:
+            t.append(event["text"], style="dim")
+        return t
 
 
 def main():

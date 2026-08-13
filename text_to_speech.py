@@ -23,7 +23,7 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 settings.setup_directories()
-timing_info = {
+timing_info: dict[str, float | None] = {
     "input_received": None,
     "llm_first_token": None,
     "audio_queued": None,
@@ -55,6 +55,7 @@ def process_input(
     messages.append({"role": "user", "content": user_input})
     print("\nThinking...")
 
+    audio_queue: AudioGenerationQueue | None = None
     try:
         response_stream = get_ai_response(
             session=session,
@@ -122,7 +123,7 @@ def process_input(
 
     except Exception as e:
         print(f"\nError during streaming: {str(e)}")
-        if "audio_queue" in locals():
+        if audio_queue is not None:
             audio_queue.stop()
 
 

@@ -65,7 +65,7 @@ class AudioGenerationQueue:
             self.generation_thread = None
 
             logging.info(
-                f"\nAudio Generation Complete - Processed: {self.sentences_processed}, Generated: {self.audio_generated}, Failed: {len(self.failed_sentences)}"
+                f"\n[TTS] Audio Generation Complete - Processed: {self.sentences_processed}, Generated: {self.audio_generated}, Failed: {len(self.failed_sentences)}"
             )
 
     def add_sentences(self, sentences: List[str]):

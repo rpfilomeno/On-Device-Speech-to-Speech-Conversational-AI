@@ -14,7 +14,7 @@ def generate_and_play_sentences(
     check_interrupt: Optional[Callable] = None,
     output_dir: Optional[Path] = None,
     sample_rate: Optional[int] = None,
-) -> Tuple[bool, Optional[np.ndarray], List[Path]]:
+) -> Tuple[bool, Optional[np.ndarray], List[str]]:
     """
     Generates and plays audio for each sentence with optional interruption checking.
 
@@ -33,7 +33,7 @@ def generate_and_play_sentences(
             - Optional audio data if the process was interrupted.
             - A list of paths to the generated audio files.
     """
-    audio_queue = AudioGenerationQueue(generator, speed, output_dir)
+    audio_queue = AudioGenerationQueue(generator, speed)
     audio_queue.start()
     audio_queue.add_sentences(sentences)
 

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 import pyaudio
 import numpy as np
 import torch
@@ -18,7 +19,7 @@ SPEECH_CHECK_THRESHOLD = settings.SPEECH_CHECK_THRESHOLD
 MAX_SILENCE_DURATION = settings.MAX_SILENCE_DURATION
 
 
-def ensure_model_downloaded(repo_id: str, local_dir: str, token: str = None) -> Path:
+def ensure_model_downloaded(repo_id: str, local_dir: str, token: Optional[str] = None) -> Path:
     """Ensures that a Hugging Face model repository is downloaded into a local directory.
 
     If the local directory does not exist or is empty, downloads from HF Hub.
@@ -65,7 +66,11 @@ def ensure_model_downloaded(repo_id: str, local_dir: str, token: str = None) -> 
     return target_path
 
 
-def init_whisper_model(model_id: str = None, model_dir: str = None, hf_token: str = None):
+def init_whisper_model(
+    model_id: Optional[str] = None,
+    model_dir: Optional[str] = None,
+    hf_token: Optional[str] = None,
+):
     """Initializes the Whisper processor and model, downloading to local_dir first if missing.
 
     Args:
@@ -114,8 +119,9 @@ def init_vad_pipeline(hf_token):
     )
 
     model = Model.from_pretrained(
-        str(vad_dir), use_auth_token=hf_token, local_files_only=True
+        str(vad_dir), token=hf_token, local_files_only=True
     )
+    assert model is not None
 
     pipeline = VoiceActivityDetection(segmentation=model)
 
@@ -183,7 +189,7 @@ def record_audio(duration=None):
     p = pyaudio.PyAudio()
 
     stream = p.open(
-        format=settings.FORMAT,
+        format=FORMAT,
         channels=settings.CHANNELS,
         rate=settings.RATE,
         input=True,
@@ -327,6 +333,7 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
         tuple: A tuple containing a boolean indicating if playback was interrupted and None, or (False, None) if playback completes without interruption.
     """
     interrupt_queue = Queue()
+    position = [0]
 
     def input_callback(indata, frames, time, status):
         """Callback for monitoring input audio."""
@@ -348,18 +355,16 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
         if not interrupt_queue.empty():
             raise sd.CallbackStop()
 
-        remaining = len(audio_data) - output_callback.position
+        remaining = len(audio_data) - position[0]
         if remaining == 0:
             raise sd.CallbackStop()
         valid_frames = min(remaining, frames)
         outdata[:valid_frames, 0] = audio_data[
-            output_callback.position : output_callback.position + valid_frames
+            position[0] : position[0] + valid_frames
         ]
         if valid_frames < frames:
             outdata[valid_frames:] = 0
-        output_callback.position += valid_frames
-
-    output_callback.position = 0
+        position[0] += valid_frames
 
     try:
         with sd.InputStream(
@@ -368,7 +373,7 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000):
             with sd.OutputStream(
                 channels=1, callback=output_callback, samplerate=sample_rate
             ):
-                while output_callback.position < len(audio_data):
+                while position[0] < len(audio_data):
                     sd.sleep(50)
                     if not interrupt_queue.empty():
                         return True, None

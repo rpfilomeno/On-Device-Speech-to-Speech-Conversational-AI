@@ -18,68 +18,56 @@ class Settings(BaseSettings):
     OUTPUT_DIR: Path = BASE_DIR / "output"
     RECORDINGS_DIR: Path = BASE_DIR / "recordings"
 
-    POCKET_TTS_URL: str = Field(
-        default="http://host.docker.internal:49112/", env="POCKET_TTS_URL"
-    )
-    POCKET_TTS_VOICE: str = Field(default="Jelai.wav", env="POCKET_TTS_VOICE")
-    SPEED: float = Field(default=1.0, env="SPEED")
-    TTS_MAX_RETRIES: int = Field(default=3, env="TTS_MAX_RETRIES")
-    HUGGINGFACE_TOKEN: Optional[str] = Field(default="", env="HUGGINGFACE_TOKEN")
+    POCKET_TTS_URL: str = Field(default="http://host.docker.internal:49112/")
+    POCKET_TTS_VOICE: str = Field(default="Jelai.wav")
+    SPEED: float = Field(default=1.0)
+    TTS_MAX_RETRIES: int = Field(default=3)
+    HUGGINGFACE_TOKEN: Optional[str] = Field(default="")
 
-    LM_STUDIO_URL: str = Field(..., env="LM_STUDIO_URL")
-    DEFAULT_SYSTEM_PROMPT: str = Field(..., env="DEFAULT_SYSTEM_PROMPT")
-    LLM_MODEL: str = Field(..., env="LLM_MODEL")
-    NUM_THREADS: int = Field(default=2, env="NUM_THREADS")
-    MAX_TOKENS: int = Field(default=512, env="MAX_TOKENS")
-    LLM_TEMPERATURE: float = Field(default=0.7, env="LMM_TEMPERATURE")
+    LM_STUDIO_URL: str = Field(...)
+    DEFAULT_SYSTEM_PROMPT: str = Field(...)
+    LLM_MODEL: str = Field(...)
+    NUM_THREADS: int = Field(default=2)
+    MAX_TOKENS: int = Field(default=512)
+    LLM_TEMPERATURE: float = Field(default=0.7)
 
-    WHISPER_MODEL_ID: str = Field(
-        default="openai/whisper-tiny.en", env="WHISPER_MODEL_ID"
-    )
-    WHISPER_MODEL_DIR: str = Field(
-        default="data/models/whisper-tiny.en", env="WHISPER_MODEL_DIR"
-    )
+    WHISPER_MODEL_ID: str = Field(default="openai/whisper-tiny.en")
+    WHISPER_MODEL_DIR: str = Field(default="data/models/whisper-tiny.en")
 
-    VAD_MODEL_ID: str = Field(
-        default="pyannote/segmentation-3.0", env="VAD_MODEL_ID"
-    )
-    VAD_MODEL_DIR: str = Field(
-        default="data/models/segmentation-3.0", env="VAD_MODEL_DIR"
-    )
-    VAD_MIN_DURATION_ON: float = Field(default=0.1, env="VAD_MIN_DURATION_ON")
-    VAD_MIN_DURATION_OFF: float = Field(default=0.1, env="VAD_MIN_DURATION_OFF")
+    VAD_MODEL_ID: str = Field(default="pyannote/segmentation-3.0")
+    VAD_MODEL_DIR: str = Field(default="data/models/segmentation-3.0")
+    VAD_MIN_DURATION_ON: float = Field(default=0.1)
+    VAD_MIN_DURATION_OFF: float = Field(default=0.1)
 
-    CHUNK: int = Field(default=1024, env="CHUNK")
-    FORMAT: str = Field(default="pyaudio.paFloat32", env="FORMAT")
-    CHANNELS: int = Field(default=1, env="CHANNELS")
-    RATE: int = Field(default=16000, env="RATE")
-    RECORD_DURATION: int = Field(default=5, env="RECORD_DURATION")
-    SILENCE_THRESHOLD: float = Field(default=0.01, env="SILENCE_THRESHOLD")
-    INTERRUPTION_THRESHOLD: float = Field(default=0.005, env="INTERRUPTION_THRESHOLD")
-    MAX_SILENCE_DURATION: int = Field(default=1, env="MAX_SILENCE_DURATION")
-    SPEECH_CHECK_TIMEOUT: float = Field(default=0.1, env="SPEECH_CHECK_TIMEOUT")
-    SPEECH_CHECK_THRESHOLD: float = Field(default=0.005, env="SPEECH_CHECK_THRESHOLD")
-    ROLLING_BUFFER_TIME: float = Field(default=0.5, env="ROLLING_BUFFER_TIME")
-    TARGET_SIZE: int = Field(default=15, env="TARGET_SIZE")
-    FIRST_SENTENCE_SIZE: int = Field(default=3, env="FIRST_SENTENCE_SIZE")
-    PLAYBACK_DELAY: float = Field(default=0.005, env="PLAYBACK_DELAY")
-    LOG_TTS_CHUNKS: bool = Field(default=True, env="LOG_TTS_CHUNKS")
-    LOG_TWITCH_CHATS: bool = Field(default=True, env="LOG_TWITCH_CHATS")
+    CHUNK: int = Field(default=1024)
+    FORMAT: str = Field(default="pyaudio.paFloat32")
+    CHANNELS: int = Field(default=1)
+    RATE: int = Field(default=16000)
+    RECORD_DURATION: int = Field(default=5)
+    SILENCE_THRESHOLD: float = Field(default=0.01)
+    INTERRUPTION_THRESHOLD: float = Field(default=0.005)
+    MAX_SILENCE_DURATION: int = Field(default=1)
+    SPEECH_CHECK_TIMEOUT: float = Field(default=0.1)
+    SPEECH_CHECK_THRESHOLD: float = Field(default=0.005)
+    ROLLING_BUFFER_TIME: float = Field(default=0.5)
+    TARGET_SIZE: int = Field(default=15)
+    FIRST_SENTENCE_SIZE: int = Field(default=3)
+    PLAYBACK_DELAY: float = Field(default=0.005)
+    LOG_TTS_CHUNKS: bool = Field(default=True)
+    LOG_TWITCH_CHATS: bool = Field(default=True)
 
-    TWITCH_CLIENT_ID: Optional[str] = Field(default="", env="TWITCH_CLIENT_ID")
-    TWITCH_CLIENT_SECRET: Optional[str] = Field(default="", env="TWITCH_CLIENT_SECRET")
-    TWITCH_CLIENT_CHANNEL: Optional[str] = Field(default="", env="TWITCH_CLIENT_CHANNEL")
-    TWITCH_MAX_CHAT_SIZE: int = Field(default=50, env="TWITCH_MAX_CHAT_SIZE")
-    TWITCH_MAX_CHAT_AGE: float = Field(default=180.0, env="TWITCH_MAX_CHAT_AGE")
+    TWITCH_CLIENT_ID: Optional[str] = Field(default="")
+    TWITCH_CLIENT_SECRET: Optional[str] = Field(default="")
+    TWITCH_CLIENT_CHANNEL: Optional[str] = Field(default="")
+    TWITCH_MAX_CHAT_SIZE: int = Field(default=50)
+    TWITCH_MAX_CHAT_AGE: float = Field(default=180.0)
 
-    MAX_IDLE_TIME: float = Field(default=60.0, env="MAX_IDLE_TIME")
+    MAX_IDLE_TIME: float = Field(default=60.0)
     TWITCH_CHAT_PROMPT: str = Field(
-        default="You noticed there are messages and events from twitch chat, try to respond or react to them: {TWITCH_CHATS_AND_EVENTS}",
-        env="TWITCH_CHAT_PROMPT",
+        default="You noticed there are messages and events from twitch chat, try to respond or react to them: {TWITCH_CHATS_AND_EVENTS}"
     )
     IDLE_PROMPTS: str = Field(
-        default="Make a joke, Tell what you dreamt last night, Tell us an unforgettable memory, What is the fact-of-the-day, Tell us thinf you plan to do someday",
-        env="IDLE_PROMPTS",
+        default="Make a joke, Tell what you dreamt last night, Tell us an unforgettable memory, What is the fact-of-the-day, Tell us thinf you plan to do someday"
     )
 
     def get_idle_prompts_list(self) -> list[str]:

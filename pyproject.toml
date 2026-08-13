@@ -23,8 +23,9 @@ dependencies = [
   "twitch-python>=0.0.20",
 ]
 
+
 [tool.pyrefly]
-search_path = ["src"]
+search_path = ["."]
 
 [dependency-groups]
 dev = [
