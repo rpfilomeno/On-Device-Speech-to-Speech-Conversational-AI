@@ -561,8 +561,19 @@ SLASH_COMMANDS = [
     ("/now", "Trigger the idle event immediately"),
     ("/pause", "Suspend voice output and the idle countdown"),
     ("/play", "Resume from pause"),
+    ("/slap", "Erase queued Twitch messages, or /slap @user for just theirs"),
     ("/help", "Show this list of slash commands"),
 ]
+
+
+def _twitch_usernames() -> list[str]:
+    """Usernames currently present in the queued Twitch chat events."""
+    names = set()
+    for e in twitch_collector.snapshot(max_size=500):
+        m = re.match(r"\[Chat\] (\S+):", e["text"])
+        if m:
+            names.add(m.group(1))
+    return sorted(names)
 
 
 class ChatInput(Input):
@@ -593,6 +604,17 @@ class ChatInput(Input):
             prefix = value[1:].lower()
             self._suggestion_matches = [
                 c for c in SLASH_COMMANDS if c[0].startswith("/" + prefix)
+            ]
+            self._suggestion_index = 0
+            self._render_suggestions()
+        elif value.startswith("/slap ") and value.strip():
+            raw = value[len("/slap "):].lstrip("@")
+            usernames = [
+                u for u in _twitch_usernames()
+                if u.lower().startswith(raw.lower())
+            ]
+            self._suggestion_matches = [
+                (f"/slap @{u}", f"erase queued chat from @{u}") for u in usernames
             ]
             self._suggestion_index = 0
             self._render_suggestions()
@@ -898,7 +920,9 @@ class SpeechTUI(App):
 
     def _run_command(self, raw: str):
         try:
-            name = raw.strip().split()[0].lower()
+            parts = raw.strip().split(None, 1)
+            name = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else ""
             handler = {
                 "/quit": self._cmd_quit,
                 "/clear": self._cmd_clear,
@@ -906,46 +930,60 @@ class SpeechTUI(App):
                 "/now": self._cmd_now,
                 "/pause": self._cmd_pause,
                 "/play": self._cmd_play,
+                "/slap": self._cmd_slap,
                 "/help": self._cmd_help,
             }.get(name)
             if handler:
-                handler()
+                handler(arg)
             else:
                 self._notice(f"Unknown command: {raw}", color="bold red")
         except Exception as e:
             self._log_tui_error("command", e)
 
-    def _cmd_quit(self):
+    def _cmd_quit(self, arg=""):
         self.query_one("#system-menu").remove_class("-open")
         self.push_screen(QuitConfirm())
 
-    def _cmd_clear(self):
+    def _cmd_clear(self, arg=""):
         self.chat.remove_children()
         self._reset_live()
         self._notice_seen = set()
         self._bot_reply("Chat cleared.")
 
-    def _cmd_stop(self):
+    def _cmd_stop(self, arg=""):
         interrupt_event.set()
         self._bot_reply("Stopped. I've silenced my output.")
 
-    def _cmd_now(self):
+    def _cmd_now(self, arg=""):
         now_event.set()
         self._bot_reply("Idle countdown set to zero — I'll start talking now.")
 
-    def _cmd_pause(self):
+    def _cmd_pause(self, arg=""):
         pause_event.set()
         self._set_status("PAUSED")
         self._bot_reply("Paused. My voice and the idle countdown are suspended. Type /play to resume.")
 
-    def _cmd_play(self):
+    def _cmd_play(self, arg=""):
         if pause_event.is_set():
             pause_event.clear()
             self._bot_reply("Resumed. I'm listening again.")
         else:
             self._bot_reply("I wasn't paused.")
 
-    def _cmd_help(self):
+    def _cmd_slap(self, arg=""):
+        arg = arg.strip()
+        if not arg:
+            n = twitch_collector.clear_all()
+            self._bot_reply(f"Slapped the chat — erased {n} queued Twitch event(s).")
+        else:
+            username = arg.lstrip("@").strip().lower()
+            n = twitch_collector.clear_by_user(username)
+            if n:
+                self._bot_reply(f"Slapped @{username} — erased {n} queued message(s).")
+            else:
+                self._bot_reply(f"@{username} has no queued messages to slap.")
+
+    def _cmd_help(self, arg=""):
         self.push_screen(HelpScreen())
 
     # ---- main chat window ----

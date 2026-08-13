@@ -1,3 +1,4 @@
+import re
 import threading
 import time
 from collections import deque
@@ -46,6 +47,28 @@ class TwitchEventCollector:
         with self._lock:
             valid_events = [e for e in self._events if (now - e["timestamp"]) <= max_age]
             return len(valid_events) > 0
+
+    def clear_all(self) -> int:
+        """Drops every queued event. Returns how many were erased."""
+        with self._lock:
+            count = len(self._events)
+            self._events.clear()
+            return count
+
+    def clear_by_user(self, username: str) -> int:
+        """Drops queued chat events whose sender is `username`. Returns how many were erased."""
+        username = username.lower()
+        removed = 0
+        with self._lock:
+            kept = deque()
+            for e in self._events:
+                m = re.match(r"\[Chat\] (\S+):", e["text"])
+                if m and m.group(1).lower() == username:
+                    removed += 1
+                else:
+                    kept.append(e)
+            self._events = kept
+            return removed
 
 
 class TwitchBotManager:
