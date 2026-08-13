@@ -19,6 +19,60 @@ SPEECH_CHECK_THRESHOLD = settings.SPEECH_CHECK_THRESHOLD
 MAX_SILENCE_DURATION = settings.MAX_SILENCE_DURATION
 
 
+def _pyaudio_input_index(p, name: str):
+    """Resolve a device name to its PyAudio input-device index (None = default)."""
+    if not name:
+        return None
+    try:
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if int(info.get("maxInputChannels", 0) or 0) > 0 and info.get("name") == name:
+                return i
+    except Exception:
+        pass
+    return None
+
+
+def _sd_device_index(name: str, want_input: bool):
+    """Resolve a device name to its sounddevice index (None = default)."""
+    if not name:
+        return None
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("name") != name:
+                continue
+            if want_input and d.get("max_input_channels", 0) > 0:
+                return i
+            if not want_input and d.get("max_output_channels", 0) > 0:
+                return i
+    except Exception:
+        pass
+    return None
+
+
+def list_audio_devices() -> tuple[list[str], list[str]]:
+    """Return (input device names, output device names) for the /config dialog."""
+    inputs, outputs = [], []
+    try:
+        p = pyaudio.PyAudio()
+        try:
+            for i in range(p.get_device_count()):
+                info = p.get_device_info_by_index(i)
+                if int(info.get("maxInputChannels", 0) or 0) > 0:
+                    inputs.append(info["name"])
+        finally:
+            p.terminate()
+    except Exception:
+        pass
+    try:
+        for d in sd.query_devices():
+            if d.get("max_output_channels", 0) > 0:
+                outputs.append(d["name"])
+    except Exception:
+        pass
+    return inputs, outputs
+
+
 def ensure_model_downloaded(repo_id: str, local_dir: str, token: Optional[str] = None) -> Path:
     """Ensures that a Hugging Face model repository is downloaded into a local directory.
 
@@ -194,6 +248,7 @@ def record_audio(duration=None):
         rate=settings.RATE,
         input=True,
         frames_per_buffer=settings.CHUNK,
+        input_device_index=_pyaudio_input_index(p, settings.MIC_DEVICE),
     )
 
     print("\nRecording...")
@@ -225,7 +280,8 @@ def record_continuous_audio(max_wait=None):
     p = pyaudio.PyAudio()
 
     stream = p.open(
-        format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK
+        format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK,
+        input_device_index=_pyaudio_input_index(p, settings.MIC_DEVICE),
     )
 
     frames = []
@@ -300,6 +356,7 @@ def check_for_speech(timeout=0.1):
             rate=RATE,
             input=True,
             frames_per_buffer=CHUNK,
+            input_device_index=_pyaudio_input_index(p, settings.MIC_DEVICE),
         )
 
         for _ in range(int(RATE * timeout / CHUNK)):
@@ -336,6 +393,8 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None):
     stop_events = stop_events or []
     interrupt_queue = Queue()
     position = [0]
+    mic_device = _sd_device_index(settings.MIC_DEVICE, want_input=True)
+    spk_device = _sd_device_index(settings.SPEAKER_DEVICE, want_input=False)
 
     def input_callback(indata, frames, time, status):
         """Callback for monitoring input audio."""
@@ -370,10 +429,10 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None):
 
     try:
         with sd.InputStream(
-            channels=1, callback=input_callback, samplerate=settings.RATE
+            channels=1, callback=input_callback, samplerate=settings.RATE, device=mic_device
         ):
             with sd.OutputStream(
-                channels=1, callback=output_callback, samplerate=sample_rate
+                channels=1, callback=output_callback, samplerate=sample_rate, device=spk_device
             ):
                 while position[0] < len(audio_data):
                     sd.sleep(50)

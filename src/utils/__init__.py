@@ -5,7 +5,8 @@ from .audio_utils import save_audio_file, generate_and_play_sentences
 from .speech import (
     init_vad_pipeline, detect_speech_segments, record_audio,
     record_continuous_audio, check_for_speech, play_audio_with_interrupt,
-    transcribe_audio, init_whisper_model, ensure_model_downloaded
+    transcribe_audio, init_whisper_model, ensure_model_downloaded,
+    list_audio_devices,
 )
 from .config import settings
 from .text_chunker import TextChunker
@@ -27,6 +28,7 @@ __all__ = [
     'transcribe_audio',
     'init_whisper_model',
     'ensure_model_downloaded',
+    'list_audio_devices',
     'settings',
     'TextChunker',
     'twitch_collector',

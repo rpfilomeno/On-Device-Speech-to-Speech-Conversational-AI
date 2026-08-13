@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     TARGET_SIZE: int = Field(default=15)
     FIRST_SENTENCE_SIZE: int = Field(default=3)
     PLAYBACK_DELAY: float = Field(default=0.005)
+    MIC_DEVICE: str = Field(default="")
+    SPEAKER_DEVICE: str = Field(default="")
     LOG_TTS_CHUNKS: bool = Field(default=True)
     LOG_TWITCH_CHATS: bool = Field(default=True)
 

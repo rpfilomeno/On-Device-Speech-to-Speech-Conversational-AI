@@ -22,6 +22,7 @@ from src.utils import (
     record_continuous_audio,
     check_for_speech,
     transcribe_audio,
+    list_audio_devices,
     twitch_collector,
     twitch_bot_manager,
 )
@@ -36,7 +37,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Button, Footer, Header, Input, Label, ProgressBar, RichLog, Static
+from textual.widgets import Button, Footer, Header, Input, Label, OptionList, ProgressBar, RichLog, Static
 
 settings.setup_directories()
 
@@ -628,6 +629,7 @@ SLASH_COMMANDS = [
     ("/pause", "Suspend voice output and the idle countdown"),
     ("/play", "Resume from pause"),
     ("/slap", "Erase queued Twitch messages, or /slap @user for just theirs"),
+    ("/config", "Pick the microphone and speaker devices"),
     ("/help", "Show this list of slash commands"),
 ]
 
@@ -833,6 +835,85 @@ class HelpScreen(Screen):
         self.app.pop_screen()
 
 
+class ConfigScreen(Screen):
+    """Modal dialog to pick the microphone (input) and speaker (output) devices."""
+
+    CSS = """
+    ConfigScreen { align: center middle; }
+    #config-dialog {
+        width: 76;
+        height: auto;
+        padding: 1 2;
+        border: round $accent;
+        background: $panel;
+    }
+    #config-dialog OptionList { height: 8; margin-bottom: 1; }
+    .config-label { text-style: bold; height: 1; }
+    #config-hint { color: $text-muted; height: 1; margin-bottom: 1; }
+    #config-actions { height: 3; align-horizontal: center; margin-top: 1; }
+    #config-actions Button { width: 14; margin: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        inputs, outputs = list_audio_devices()
+        with Vertical(id="config-dialog"):
+            yield Static("Audio Devices", id="help-title")
+            yield Static("Arrows pick a device, Save applies. Empty list = system default.", id="config-hint")
+            yield Static("Microphone:", classes="config-label")
+            yield OptionList(*inputs, id="mic-list")
+            yield Static("Speaker:", classes="config-label")
+            yield OptionList(*outputs, id="spk-list")
+            with Horizontal(id="config-actions"):
+                yield Button("Save", id="config-save", variant="success")
+                yield Button("Cancel", id="config-cancel")
+        yield Footer()
+
+    def on_mount(self):
+        # children aren't queryable in on_mount for pushed screens; defer a frame
+        self.call_after_refresh(self._preselect)
+
+    def _preselect(self):
+        try:
+            for widget_id, current in (("#mic-list", settings.MIC_DEVICE), ("#spk-list", settings.SPEAKER_DEVICE)):
+                ol = self.query_one(widget_id, OptionList)
+                if current:
+                    for i, opt in enumerate(ol.options):
+                        if opt.prompt == current:
+                            ol.highlighted = i
+                            break
+        except Exception:
+            pass
+
+    def _selected(self, widget_id) -> str:
+        ol = self.query_one(widget_id, OptionList)
+        idx = ol.highlighted
+        if idx is None or not ol.options or idx >= len(ol.options):
+            return ""
+        return str(ol.get_option_at_index(idx).prompt)
+
+    def action_cancel(self):
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#config-cancel")
+    def _cancel(self):
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#config-save")
+    def _save(self):
+        mic = self._selected("#mic-list")
+        spk = self._selected("#spk-list")
+        settings.MIC_DEVICE = mic
+        settings.SPEAKER_DEVICE = spk
+        self.app.pop_screen()
+        cast("SpeechTUI", self.app)._bot_reply(
+            f"Audio devices set: mic '{mic or 'default'}', speaker '{spk or 'default'}'."
+        )
+
+
 # mIRC's classic per-nick color palette (hex for the 16-color table).
 _IRC_NICK_COLORS = [
     "#FF0000",  # red
@@ -997,6 +1078,7 @@ class SpeechTUI(App):
                 "/pause": self._cmd_pause,
                 "/play": self._cmd_play,
                 "/slap": self._cmd_slap,
+                "/config": self._cmd_config,
                 "/help": self._cmd_help,
             }.get(name)
             if handler:
@@ -1048,6 +1130,9 @@ class SpeechTUI(App):
                 self._bot_reply(f"Slapped @{username} — erased {n} queued message(s).")
             else:
                 self._bot_reply(f"@{username} has no queued messages to slap.")
+
+    def _cmd_config(self, arg=""):
+        self.push_screen(ConfigScreen())
 
     def _cmd_help(self, arg=""):
         self.push_screen(HelpScreen())
