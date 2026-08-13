@@ -25,3 +25,8 @@ dependencies = [
 
 [tool.pyrefly]
 search_path = ["src"]
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.2.0",
+]
