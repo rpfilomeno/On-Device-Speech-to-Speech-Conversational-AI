@@ -67,6 +67,24 @@ def emit(kind: str, *payload):
     _event_queue.put((kind, *payload))
 
 
+def _append_chat_file(name: str, text: str):
+    """Append a line to one of the turn files (auto-created if missing)."""
+    try:
+        with open(settings.OUTPUT_DIR / name, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
+
+
+def _clear_chat_files():
+    """Empty both turn files at the end of a spoken turn (files are kept, not deleted)."""
+    try:
+        for name in ("in.txt", "out.txt"):
+            open(settings.OUTPUT_DIR / name, "w", encoding="utf-8").close()
+    except Exception:
+        pass
+
+
 class _LogStream:
     """Captures sys.stdout/sys.stderr so every print() (from pipeline, TTS,
     Twitch bot) and traceback lands in the TUI's log panel instead of being
@@ -285,6 +303,7 @@ def process_input(
 
         audio_queue.stop()
         playback_thread.join()
+        _clear_chat_files()
 
         timing_info["end"] = time.perf_counter()
         print_timing_chart(timing_info)
@@ -348,6 +367,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
 
                 if is_first:
                     emit("bot_spoken", sentence)
+                    _append_chat_file("out.txt", sentence)
                 if settings.LOG_TTS_CHUNKS:
                     emit("log", f"[TTS Playing] {sentence!r}")
                 was_interrupted, interrupt_data = play_audio_with_interrupt(
@@ -1189,6 +1209,7 @@ class SpeechTUI(App):
                 t.append(f"You ({source}): ", style="bold #7fd8a4")
                 t.append(text)
                 self._chat_line(t)
+                _append_chat_file("in.txt", text)
                 self._touch()
             elif kind == "bot_token":
                 self._stream_buf += payload[0]
