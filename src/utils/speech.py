@@ -222,7 +222,6 @@ def record_continuous_audio(max_wait=None):
         format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK
     )
 
-    print("\nListening... (Press Ctrl+C to stop)")
     frames = []
     buffer_frames = []
     buffer_size = int(RATE * 0.5 / CHUNK)

@@ -33,6 +33,14 @@ class TwitchEventCollector:
             self._events = deque([e for e in valid_events if e not in recent])
             return [e["text"] for e in recent]
 
+    def snapshot(self, max_size: int = 200) -> list[dict]:
+        """Returns a copy of currently collected events (does not clear them)."""
+        with self._lock:
+            recent = list(self._events)[-max_size:]
+            return [
+                {"timestamp": e["timestamp"], "text": e["text"]} for e in recent
+            ]
+
     def has_recent_events(self, max_size: int, max_age: float) -> bool:
         now = time.time()
         with self._lock:

@@ -1,9 +1,12 @@
 import random
-import keyboard
-import traceback
+import queue
+import sys
+import threading
 import time
+import traceback
 import requests
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
+
 from src.utils.config import settings
 from src.utils import (
     VoiceGenerator,
@@ -20,10 +23,21 @@ from src.utils import (
 )
 from src.utils.audio_queue import AudioGenerationQueue
 from src.utils.llm import parse_stream_chunk
-import threading
 from src.utils.text_chunker import TextChunker
 
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Footer, Header, Input, Label, ProgressBar, RichLog
+
 settings.setup_directories()
+
+# ---- Event bus: pipeline thread(s) -> TUI main thread ----
+_event_queue: queue.Queue = queue.Queue()
+# TUI -> pipeline thread: typed text to send to the bot
+text_input_queue: queue.Queue = queue.Queue()
+shutdown_event = threading.Event()
+
 timing_info = {
     "vad_start": None,
     "transcription_start": None,
@@ -34,6 +48,45 @@ timing_info = {
     "end": None,
     "transcription_duration": None,
 }
+
+
+def emit(kind: str, *payload):
+    """Post an event to the TUI's event queue (thread-safe)."""
+    _event_queue.put((kind, *payload))
+
+
+class _LogStream:
+    """Captures sys.stdout so every print() (from pipeline, TTS, Twitch bot)
+    lands in the TUI's log panel instead of corrupting the screen."""
+
+    def __init__(self):
+        self._buf = ""
+        self._last_flush = 0.0
+
+    def write(self, text: str):
+        # keep only the tail after the last \r so tqdm progress bars collapse
+        # into their final line instead of spamming the log panel
+        if "\r" in text:
+            text = text.rsplit("\r", 1)[-1]
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                emit("log", line)
+        # show long partial lines (e.g. LLM token streaming) roughly twice a second
+        now = time.time()
+        if self._buf.strip() and now - self._last_flush >= 0.5:
+            self._last_flush = now
+            emit("log", self._buf.strip())
+
+    def flush(self):
+        if self._buf.strip():
+            emit("log", self._buf.strip())
+            self._buf = ""
+
+
+_log_stream = _LogStream()
 
 
 def process_input(
@@ -60,7 +113,8 @@ def process_input(
     timing_info["vad_start"] = time.perf_counter()
 
     messages.append({"role": "user", "content": user_input})
-    print("\nThinking...")
+    emit("status", "THINKING")
+    emit("turn_start", user_input)
     start_time = time.time()
     try:
         response_stream = get_ai_response(
@@ -73,7 +127,7 @@ def process_input(
         )
 
         if not response_stream:
-            print("Failed to get AI response stream.")
+            emit("log", "Failed to get AI response stream.")
             return False, None
 
         audio_queue = AudioGenerationQueue(generator, speed)
@@ -131,10 +185,14 @@ def process_input(
 
         timing_info["end"] = time.perf_counter()
         print_timing_chart(timing_info)
+        bot_text = " ".join(complete_response).strip()
+        if bot_text:
+            emit("turn", user_input, bot_text)
+        emit("status", "LISTENING")
         return playback_result["interrupted"], playback_result["data"]
 
     except Exception as e:
-        print(f"\nError during streaming: {str(e)}")
+        emit("log", f"Error during streaming: {str(e)}")
         if "audio_queue" in locals():
             audio_queue.stop()
         return False, None
@@ -160,8 +218,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, None]:
                 if speech_detected:
                     was_interrupted = True
                     interrupt_audio = audio_data
-                    if settings.LOG_TTS_CHUNKS:
-                        print("\n[TTS Interrupted] Speech detected from microphone! Clearing audio queues...")
+                    emit("log", "[TTS Interrupted] Speech detected from microphone! Clearing audio queues...")
                     audio_queue.clear_queues()
                     break
 
@@ -169,14 +226,14 @@ def audio_playback_worker(audio_queue) -> tuple[bool, None]:
             if audio_data is not None:
                 if not timing_info["first_audio_play"]:
                     timing_info["first_audio_play"] = time.perf_counter()
+                    emit("status", "SPEAKING")
 
                 if settings.LOG_TTS_CHUNKS:
-                    print(f"[TTS Playing] {sentence!r}")
+                    emit("log", f"[TTS Playing] {sentence!r}")
                 was_interrupted, interrupt_data = play_audio_with_interrupt(audio_data)
                 if was_interrupted:
                     interrupt_audio = interrupt_data
-                    if settings.LOG_TTS_CHUNKS:
-                        print("\n[TTS Interrupted] Interrupted during playback! Clearing audio queues...")
+                    emit("log", "[TTS Interrupted] Interrupted during playback! Clearing audio queues...")
                     audio_queue.clear_queues()
                     break
             else:
@@ -190,171 +247,159 @@ def audio_playback_worker(audio_queue) -> tuple[bool, None]:
                 break
 
     except Exception as e:
-        print(f"Error in audio playback: {str(e)}")
+        emit("log", f"Error in audio playback: {str(e)}")
 
     return was_interrupted, interrupt_audio
 
 
-def main():
-    """Main function to run the voice chat bot."""
-    with requests.Session() as session:
+def pipeline_main():
+    """Runs the voice-loop pipeline in a background thread; reports to the TUI."""
+    try:
+        emit("status", "INITIALIZING")
+        emit("log", "Initializing Whisper model...")
+        whisper_processor, whisper_model = init_whisper_model(
+            settings.WHISPER_MODEL_ID, settings.WHISPER_MODEL_DIR, hf_token=settings.HUGGINGFACE_TOKEN
+        )
+        emit("log", "Initializing Voice Activity Detection...")
+        vad_pipeline = init_vad_pipeline(settings.HUGGINGFACE_TOKEN)
+        emit("log", "Initializing voice generator (Pocket TTS remote streaming)...")
+        generator = VoiceGenerator()
+        result = generator.initialize(
+            pocket_tts_url=settings.POCKET_TTS_URL,
+            pocket_tts_voice=settings.POCKET_TTS_VOICE,
+        )
+        emit("log", result)
+        speed = settings.SPEED
+
+        session = requests.Session()
+        messages = [{"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT}]
+
+        if settings.TWITCH_CLIENT_CHANNEL:
+            emit("log", f"Starting Twitch chat collector for channel: {settings.TWITCH_CLIENT_CHANNEL}...")
+            twitch_bot_manager.start(settings.TWITCH_CLIENT_CHANNEL)
+
         try:
-            session = requests.Session()
-            generator = VoiceGenerator()
-            messages = [{"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT}]
-            print("\nInitializing Whisper model...")
-            whisper_processor, whisper_model = init_whisper_model(
-                settings.WHISPER_MODEL_ID, settings.WHISPER_MODEL_DIR, hf_token=settings.HUGGINGFACE_TOKEN
+            emit("log", "Warming up the LLM...")
+            response_stream = get_ai_response(
+                session=session,
+                messages=[
+                    {"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT},
+                    {"role": "user", "content": "Hi!"},
+                ],
+                llm_model=settings.LLM_MODEL,
+                llm_url=settings.LM_STUDIO_URL,
+                max_tokens=settings.MAX_TOKENS,
+                stream=False,
             )
-            print("\nInitializing Voice Activity Detection...")
-            vad_pipeline = init_vad_pipeline(settings.HUGGINGFACE_TOKEN)
-            print("\n=== Voice Chat Bot Initializing ===")
-            print("\nInitializing voice generator (Pocket TTS remote streaming)...")
-            result = generator.initialize(
-                pocket_tts_url=settings.POCKET_TTS_URL,
-                pocket_tts_voice=settings.POCKET_TTS_VOICE,
-            )
-            print(result)
-            speed = settings.SPEED
+            if not response_stream:
+                emit("log", "Failed to initialize the AI model!")
+        except requests.RequestException as e:
+            emit("log", f"Warmup failed: {str(e)}")
 
-            # Start Twitch chat bot background listener
-            if settings.TWITCH_CLIENT_CHANNEL:
-                print(f"\nStarting Twitch chat collector for channel: {settings.TWITCH_CLIENT_CHANNEL}...")
-                twitch_bot_manager.start(settings.TWITCH_CLIENT_CHANNEL)
+        emit("status", "LISTENING")
+        emit("log", "=== Ready. Speaking to me (or type below) triggers a response. ===")
+        last_activity_time = time.time()
 
+        while not shutdown_event.is_set():
             try:
-                print("\nWarming up the LM Studio model...")
-                response_stream = get_ai_response(
-                    session=session,
-                    messages=[
-                        {"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT},
-                        {"role": "user", "content": "Hi!"},
-                    ],
-                    llm_model=settings.LLM_MODEL,
-                    llm_url=settings.LM_STUDIO_URL,
-                    max_tokens=settings.MAX_TOKENS,
-                    stream=False,
-                )
-                if not response_stream:
-                    print("Failed to initialized the AI model!")
-                    return
-            except requests.RequestException as e:
-                print(f"Warmup failed: {str(e)}")
+                text = text_input_queue.get_nowait()
+            except queue.Empty:
+                text = None
 
-            print("\n\n=== Voice Chat Bot Ready ===")
-            print("The bot is now listening for speech.")
-            print("Just start speaking, and I'll respond automatically!")
-            print("You can interrupt me anytime by starting to speak.")
+            if text is not None:
+                last_activity_time = time.time()
+                process_input(session, text, messages, generator, speed)
+                last_activity_time = time.time()
+                continue
 
-            last_activity_time = time.time()
+            audio_data = record_continuous_audio(max_wait=1.0)
+            if audio_data is not None:
+                speech_segments = detect_speech_segments(vad_pipeline, audio_data)
 
-            while True:
-                try:
-                    if keyboard.is_pressed("enter"):
-                        user_input = input("\nYou (text): ").strip()
+                if speech_segments is not None:
+                    last_activity_time = time.time()
+                    emit("activity")
+                    emit("status", "TRANSCRIBING")
+                    timing_info["transcription_start"] = time.perf_counter()
 
-                        if user_input.lower() == "quit":
-                            print("Goodbye!")
-                            break
+                    user_input = transcribe_audio(
+                        whisper_processor, whisper_model, speech_segments
+                    )
 
-                        if user_input:
-                            last_activity_time = time.time()
-                            was_interrupted, speech_data = process_input(
-                                session, user_input, messages, generator, speed
-                            )
-                            last_activity_time = time.time()
-                            continue
-
-                    audio_data = record_continuous_audio(max_wait=5.0)
-                    if audio_data is not None:
-                        speech_segments = detect_speech_segments(
-                            vad_pipeline, audio_data
+                    timing_info["transcription_duration"] = (
+                        time.perf_counter() - timing_info["transcription_start"]
+                    )
+                    if user_input.strip():
+                        emit("transcript", "voice", user_input)
+                        was_interrupted, speech_data = process_input(
+                            session, user_input, messages, generator, speed
                         )
+                        last_activity_time = time.time()
+                        emit("activity")
 
-                        if speech_segments is not None:
-                            last_activity_time = time.time()
-                            print("\nTranscribing detected speech...")
-                            timing_info["transcription_start"] = time.perf_counter()
-
-                            user_input = transcribe_audio(
-                                whisper_processor, whisper_model, speech_segments
+                        if was_interrupted and speech_data is not None:
+                            speech_segments = detect_speech_segments(
+                                vad_pipeline, speech_data
                             )
-
-                            timing_info["transcription_duration"] = (
-                                time.perf_counter() - timing_info["transcription_start"]
-                            )
-                            if user_input.strip():
-                                print(f"You (voice): {user_input}")
-                                was_interrupted, speech_data = process_input(
-                                    session, user_input, messages, generator, speed
+                            if speech_segments is not None:
+                                emit("log", "Transcribing interrupted speech...")
+                                emit("status", "TRANSCRIBING")
+                                user_input = transcribe_audio(
+                                    whisper_processor,
+                                    whisper_model,
+                                    speech_segments,
                                 )
-                                last_activity_time = time.time()
-
-                                if was_interrupted and speech_data is not None:
-                                    speech_segments = detect_speech_segments(
-                                        vad_pipeline, speech_data
+                                if user_input.strip():
+                                    emit("transcript", "voice", user_input)
+                                    process_input(
+                                        session,
+                                        user_input,
+                                        messages,
+                                        generator,
+                                        speed,
                                     )
-                                    if speech_segments is not None:
-                                        print("\nTranscribing interrupted speech...")
-                                        user_input = transcribe_audio(
-                                            whisper_processor,
-                                            whisper_model,
-                                            speech_segments,
-                                        )
-                                        if user_input.strip():
-                                            print(f"You (voice): {user_input}")
-                                            process_input(
-                                                session,
-                                                user_input,
-                                                messages,
-                                                generator,
-                                                speed,
-                                            )
-                                            last_activity_time = time.time()
-                        else:
-                            print("No clear speech detected, please try again.")
+                                    last_activity_time = time.time()
+                                    emit("activity")
                     else:
-                        # Check idle condition if no voice input was detected
-                        idle_elapsed = time.time() - last_activity_time
-                        if idle_elapsed >= settings.MAX_IDLE_TIME:
-                            print(f"\n[Idle Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
-                            
-                            # Check if recent Twitch events/messages are available
-                            twitch_events = twitch_collector.get_recent_events(
-                                max_size=settings.TWITCH_MAX_CHAT_SIZE,
-                                max_age=settings.TWITCH_MAX_CHAT_AGE,
-                            )
+                        emit("log", "No clear speech detected, please try again.")
+                else:
+                    emit("log", "No clear speech detected, please try again.")
+            else:
+                # Check idle condition if no voice input was detected
+                idle_elapsed = time.time() - last_activity_time
+                if idle_elapsed >= settings.MAX_IDLE_TIME:
+                    emit("status", "IDLE")
+                    emit("log", f"[Idle Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
 
-                            if twitch_events:
-                                events_summary = "\n".join(twitch_events)
-                                prompt_text = settings.TWITCH_CHAT_PROMPT.format(
-                                    TWITCH_CHATS_AND_EVENTS=events_summary
-                                )
-                                print(f"[Twitch Idle Event] Responding to {len(twitch_events)} collected Twitch event(s)...")
-                            else:
-                                idle_prompts = settings.get_idle_prompts_list()
-                                prompt_text = random.choice(idle_prompts)
-                                print(f"[Random Idle Event] Picked prompt: '{prompt_text}'")
+                    # Check if recent Twitch events/messages are available
+                    twitch_events = twitch_collector.get_recent_events(
+                        max_size=settings.TWITCH_MAX_CHAT_SIZE,
+                        max_age=settings.TWITCH_MAX_CHAT_AGE,
+                    )
 
-                            process_input(session, prompt_text, messages, generator, speed)
-                            last_activity_time = time.time()
+                    if twitch_events:
+                        events_summary = "\n".join(twitch_events)
+                        prompt_text = settings.TWITCH_CHAT_PROMPT.format(
+                            TWITCH_CHATS_AND_EVENTS=events_summary
+                        )
+                        emit("log", f"[Twitch Idle Event] Responding to {len(twitch_events)} collected Twitch event(s)...")
+                    else:
+                        idle_prompts = settings.get_idle_prompts_list()
+                        prompt_text = random.choice(idle_prompts)
+                        emit("log", f"[Random Idle Event] Picked prompt: '{prompt_text}'")
 
-                    if session is not None:
-                        session.headers.update({"Connection": "keep-alive"})
-                        if hasattr(session, "connection_pool"):
-                            session.connection_pool.clear()
+                    process_input(session, prompt_text, messages, generator, speed)
+                    last_activity_time = time.time()
+                    emit("activity")
 
-                except KeyboardInterrupt:
-                    print("\nStopping...")
-                    break
-                except Exception as e:
-                    print(f"Error: {str(e)}")
-                    continue
+                if session is not None:
+                    session.headers.update({"Connection": "keep-alive"})
+                    if hasattr(session, "connection_pool"):
+                        session.connection_pool.clear()
 
-        except Exception as e:
-            print(f"Error: {str(e)}")
-            print("\nFull traceback:")
-            traceback.print_exc()
+    except Exception as e:
+        emit("error", f"{type(e).__name__}: {str(e)}")
+        emit("log", traceback.format_exc())
 
 
 def print_timing_chart(metrics):
@@ -383,6 +428,203 @@ def print_timing_chart(metrics):
         delta = t - prev_time
         print(f"{name:<25} | {elapsed:9.2f} | {delta:6.2f}")
         prev_time = t
+
+
+class ChatInput(Input):
+    """Text input that sends lines to the pipeline thread."""
+
+    BINDINGS = [
+        Binding("escape", "unfocus", "Unfocus input"),
+        Binding("ctrl+q", "exit_app", "Quit"),
+    ]
+
+    def action_unfocus(self):
+        self.screen.set_focus(None)
+
+    def action_exit_app(self):
+        self.app.exit()
+
+    def on_input_submitted(self, event: Input.Submitted):
+        text = event.value.strip()
+        if text:
+            text_input_queue.put(text)
+            emit("activity")
+            emit("transcript", "text", text)
+            self.value = ""
+
+
+class SpeechTUI(App):
+    TITLE = "On-Device Speech-to-Speech AI"
+
+    BINDINGS = [
+        Binding("q", "exit_app", "Quit"),
+        Binding("t", "focus_input", "Text input"),
+    ]
+
+    CSS = """
+    #main { height: 1fr; }
+    #row1 { height: 2fr; }
+    #row2 { height: 2fr; }
+    #idle-panel, #twitch-log, #transcript-log, #history-log {
+        width: 1fr;
+        border: round $accent;
+    }
+    #log { height: 3fr; border: round $primary; }
+    #state-label { height: 1; text-style: bold; padding: 0 1; }
+    #idle-count { height: 1; padding: 0 1; }
+    #last-activity { height: 1; color: $text-muted; padding: 0 1; }
+    #idle-bar { height: 1; margin: 0 1 1 1; }
+    #idle-tip { height: 2; color: $text-muted; padding: 0 1; }
+    #text-input { height: 3; }
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.status = "STARTING"
+        self.last_activity = time.time()
+        self.twitch_cache = None
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical(id="main"):
+            with Horizontal(id="row1"):
+                with Vertical(id="idle-panel"):
+                    yield Label("STATUS / IDLE COUNTDOWN", id="state-label")
+                    yield Label(f"[bold]{self.status}[/]", id="status-text")
+                    yield ProgressBar(total=settings.MAX_IDLE_TIME, show_eta=False, show_percentage=False, id="idle-bar")
+                    yield Label(id="idle-count")
+                    yield Label(id="last-activity")
+                    yield Label(f"Idle trigger at MAX_IDLE_TIME={settings.MAX_IDLE_TIME:.0f}s of silence", id="idle-tip")
+                yield self._rich_log("twitch-log", "Twitch chat (pending)")
+            with Horizontal(id="row2"):
+                yield self._rich_log("transcript-log", "Transcriptions")
+                yield self._rich_log("history-log", "Conversation history")
+            yield self._rich_log("log", "Log", id="log", max_lines=2000)
+            yield ChatInput(id="text-input", placeholder="Type a message for the bot, Enter to send (Ctrl+Q quits)...")
+        yield Footer()
+
+    def _rich_log(self, widget_id, title, id=None, max_lines=200):
+        w = RichLog(id=id or widget_id, markup=True, max_lines=max_lines)
+        w.border_title = title
+        return w
+
+    def on_mount(self):
+        self.state_label: Label = self.query_one("#state-label", Label)
+        self.status_text: Label = self.query_one("#status-text", Label)
+        self.idle_bar: ProgressBar = self.query_one("#idle-bar", ProgressBar)
+        self.idle_count: Label = self.query_one("#idle-count", Label)
+        self.last_activity_label: Label = self.query_one("#last-activity", Label)
+        self.twitch_log: RichLog = self.query_one("#twitch-log", RichLog)
+        self.transcript_log: RichLog = self.query_one("#transcript-log", RichLog)
+        self.history_log: RichLog = self.query_one("#history-log", RichLog)
+        self.log_panel: RichLog = self.query_one("#log", RichLog)
+
+        sys.stdout = _log_stream
+        sys.stderr = _log_stream
+        self.set_interval(0.1, self._poll_events)
+        self.set_interval(0.25, self._update_idle)
+        threading.Thread(target=pipeline_main, daemon=True).start()
+        self._set_status("INITIALIZING")
+
+    def on_unmount(self):
+        shutdown_event.set()
+        if isinstance(sys.stdout, _LogStream):
+            sys.stdout = sys.__stdout__
+        if isinstance(sys.stderr, _LogStream):
+            sys.stderr = sys.__stderr__
+
+    def action_focus_input(self):
+        self.query_one("#text-input", Input).focus()
+
+    def action_exit_app(self):
+        self.exit()
+
+    def _set_status(self, status: str):
+        self.status = status
+        colors = {
+            "INITIALIZING": "cyan",
+            "LISTENING": "green",
+            "TRANSCRIBING": "yellow",
+            "THINKING": "magenta",
+            "SPEAKING": "blue",
+            "IDLE": "red",
+        }
+        color = colors.get(status, "white")
+        self.status_text.update(f"[bold {color}]{status}[/]")
+
+    def _touch(self):
+        self.last_activity = time.time()
+
+    def _poll_events(self):
+        try:
+            while True:
+                kind, *payload = _event_queue.get_nowait()
+                self._handle(kind, *payload)
+        except queue.Empty:
+            pass
+        self._update_twitch()
+
+    def _handle(self, kind: str, *payload):
+        if kind == "status":
+            self._set_status(payload[0])
+            self._touch()
+        elif kind == "log":
+            line = payload[0]
+            if line.startswith("[TTS") or line.startswith("[Twitch"):
+                self.log_panel.write(f"[dim]{line}[/]")
+            elif line.startswith("[Idle") or line.startswith("[Random"):
+                self.log_panel.write(f"[yellow]{line}[/]")
+            elif "Error" in line or "Traceback" in line or line.startswith("Traceback"):
+                self.log_panel.write(f"[bold red]{line}[/]")
+            else:
+                self.log_panel.write(line)
+        elif kind == "transcript":
+            source, text = payload
+            self.transcript_log.write(f"[bold #7fd8a4]You ({source}):[/] {text}")
+            self._touch()
+        elif kind == "turn":
+            user_text, bot_text = payload
+            self.history_log.write(f"[bold #ffa657]You:[/] {user_text}")
+            self.history_log.write(f"[bold #7fb4ff]Bot:[/] {bot_text}")
+            self._touch()
+        elif kind == "turn_start":
+            self._touch()
+        elif kind == "activity":
+            self._touch()
+        elif kind == "error":
+            self.log_panel.write(f"[bold red]{payload[0]}[/]")
+
+    def _update_idle(self):
+        if self.status == "LISTENING":
+            remaining = max(0.0, settings.MAX_IDLE_TIME - (time.time() - self.last_activity))
+            self.idle_count.update(f"[bold]{remaining:5.1f}s[/] until idle trigger")
+            self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
+        else:
+            self.idle_count.update(f"in turn: {self.status}")
+            self.idle_bar.update(progress=settings.MAX_IDLE_TIME, total=settings.MAX_IDLE_TIME)
+        self.last_activity_label.update(
+            f"Last activity: {time.strftime('%H:%M:%S', time.localtime(self.last_activity))}"
+        )
+
+    def _update_twitch(self):
+        events = twitch_collector.snapshot(max_size=200)
+        rendered = [
+            f"[{time.strftime('%H:%M:%S', time.localtime(e['timestamp']))}] {e['text']}"
+            for e in events
+        ]
+        key = "\n".join(rendered)
+        if key != self.twitch_cache:
+            self.twitch_cache = key
+            self.twitch_log.clear()
+            if rendered:
+                for line in rendered:
+                    self.twitch_log.write(line)
+            else:
+                self.twitch_log.write("[dim]No pending chat events[/]")
+
+
+def main():
+    SpeechTUI().run()
 
 
 if __name__ == "__main__":
