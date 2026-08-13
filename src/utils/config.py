@@ -1,9 +1,12 @@
+import json
 from pathlib import Path
 import os
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 from dotenv import load_dotenv
 load_dotenv()
+
+SETTINGS_JSON = Path(__file__).parent.parent.parent / "settings.json"
 
 from pydantic_settings import BaseSettings
 from pydantic import Field
@@ -94,7 +97,34 @@ class Settings(BaseSettings):
         extra = "ignore"
 
 
+def _load_device_settings() -> dict:
+    """Load mic/speaker devices from settings.json; create the file if missing."""
+    if not SETTINGS_JSON.exists():
+        save_device_settings(settings.MIC_DEVICE, settings.SPEAKER_DEVICE)
+        return {}
+    try:
+        data = json.loads(SETTINGS_JSON.read_text(encoding="utf-8"))
+        return {k: data.get(k, "") for k in ("MIC_DEVICE", "SPEAKER_DEVICE")}
+    except Exception:
+        return {}
+
+
+def save_device_settings(mic: str, speaker: str) -> bool:
+    """Persist mic/speaker devices to settings.json (auto-created if missing)."""
+    try:
+        SETTINGS_JSON.write_text(
+            json.dumps({"MIC_DEVICE": mic, "SPEAKER_DEVICE": speaker}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return True
+    except Exception:
+        return False
+
+
 settings = Settings()
+_devices = _load_device_settings()
+settings.MIC_DEVICE = _devices.get("MIC_DEVICE", settings.MIC_DEVICE)
+settings.SPEAKER_DEVICE = _devices.get("SPEAKER_DEVICE", settings.SPEAKER_DEVICE)
 
 
 def configure_logging():

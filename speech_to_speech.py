@@ -11,7 +11,7 @@ import numpy as np
 import requests
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-from src.utils.config import settings
+from src.utils.config import settings, save_device_settings
 from src.utils import (
     VoiceGenerator,
     get_ai_response,
@@ -908,6 +908,7 @@ class ConfigScreen(Screen):
         spk = self._selected("#spk-list")
         settings.MIC_DEVICE = mic
         settings.SPEAKER_DEVICE = spk
+        save_device_settings(mic, spk)
         self.app.pop_screen()
         cast("SpeechTUI", self.app)._bot_reply(
             f"Audio devices set: mic '{mic or 'default'}', speaker '{spk or 'default'}'."
