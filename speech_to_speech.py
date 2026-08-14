@@ -56,6 +56,8 @@ voice_event = threading.Event()
 # /memory on/off: Qdrant long-term memory on/off (RAM fallback when off); pipeline thread switches
 memory_request_queue: queue.Queue = queue.Queue()
 memory_status: dict[str, str | bool] = {"enabled": False, "backend": "RAM"}
+# /new: reset the current chat session (clear LLM history); pipeline thread applies it
+new_chat_event = threading.Event()
 
 timing_info: dict[str, float | None] = {
     "vad_start": None,
@@ -461,10 +463,10 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     return was_interrupted, interrupt_audio
 
 
-def init_memory(mode: str) -> tuple[MemoryWorker, str]:
-    """Build a memory backend. mode='off' -> RAM; mode='on' -> Qdrant (RAM fallback). Returns (worker, label)."""
+def init_memory(mode: str) -> tuple[MemoryWorker | None, str]:
+    """Build a memory backend. mode='off' -> None (no embedding calls); mode='on' -> Qdrant (RAM fallback). Returns (worker, label)."""
     if mode != "on":
-        return MemoryWorker(RamMemory(settings.LM_STUDIO_URL, settings.EMBEDDING_MODEL)), "RAM"
+        return None, "off"
     try:
         if not settings.QDRANT_HOST:
             raise RuntimeError("QDRANT_HOST not set")
@@ -575,6 +577,11 @@ def pipeline_main():
                 memory, label = init_memory("off")
                 memory_status.update(enabled=False, backend=label)
                 emit("log", f"[Memory] Long-term memory: {label}.")
+
+            if new_chat_event.is_set():
+                new_chat_event.clear()
+                messages = [{"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT}]
+                emit("log", "[Chat] New session started — LLM history cleared.")
 
             if not voice_event.is_set():
                 audio_data = None
@@ -733,6 +740,7 @@ SLASH_COMMANDS = [
     ("/config", "Pick the microphone and speaker devices"),
     ("/voice", "Show voice-input status; /voice on|off enables/disables VAD + transcription"),
     ("/memory", "Show memory status; /memory on|off toggles Qdrant long-term memory (RAM fallback)"),
+    ("/new", "Start a new chat session (clears LLM history)"),
     ("/help", "Show this list of slash commands"),
 ]
 
@@ -1187,6 +1195,7 @@ class SpeechTUI(App):
                 "/config": self._cmd_config,
                 "/voice": self._cmd_voice,
                 "/memory": self._cmd_memory,
+                "/new": self._cmd_new,
                 "/help": self._cmd_help,
             }.get(name)
             if handler:
@@ -1265,15 +1274,19 @@ class SpeechTUI(App):
                 self._bot_reply("Switching to Qdrant long-term memory...")
         elif arg == "off":
             if not memory_status["enabled"]:
-                self._bot_reply(f"Qdrant memory is already OFF — using {memory_status['backend']}.")
+                self._bot_reply("Long-term memory is already OFF.")
             else:
                 memory_request_queue.put("off")
-                self._bot_reply("Switching to RAM memory...")
+                self._bot_reply("Switching off long-term memory...")
         else:
             if memory_status["enabled"]:
                 self._bot_reply(f"Qdrant long-term memory is ON ({memory_status['backend']}).")
             else:
-                self._bot_reply(f"Qdrant long-term memory is OFF — using {memory_status['backend']}.")
+                self._bot_reply("Long-term memory is OFF.")
+
+    def _cmd_new(self, arg=""):
+        new_chat_event.set()
+        self._bot_reply("Starting a new chat session — history cleared.")
 
     def _cmd_help(self, arg=""):
         self.push_screen(HelpScreen())
