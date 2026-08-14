@@ -190,6 +190,34 @@ def _restore_error_routing():
     threading.excepthook = _orig_thread_excepthook
 
 
+_TRIM_GRACE_RETRIES = 2  # transient failures don't shrink context; trim only after this many consecutive retries
+
+
+def _trim_history(messages: list, drop_turns: int) -> bool:
+    """Drop the oldest `drop_turns` completed turns from the middle of the
+    conversation (keeps the system prompt and the current user message), so each
+    retry sends a smaller context. Returns True if anything was dropped."""
+    n_drop = min(2 * drop_turns, len(messages) - 2)
+    if n_drop < 2:
+        return False
+    del messages[1:1 + n_drop]
+    return True
+
+
+def _retry_llm(messages: list, retry: int, reason: str) -> bool:
+    """Retry a failed LLM call. The first few failures (server busy, model
+    loading) retry as-is and let the history grow; only later failures start
+    trimming older turns so the context can actually shrink. Returns True if a
+    retry is worth another attempt."""
+    if retry >= _TRIM_GRACE_RETRIES:
+        if not _trim_history(messages, 1 + (retry - _TRIM_GRACE_RETRIES)):
+            return False
+        emit("log", f"{reason} - trimmed history and retrying.")
+    else:
+        emit("log", f"{reason} - retrying without trimming history.")
+    return True
+
+
 def process_input(
     session: requests.Session,
     user_input: str,
@@ -218,22 +246,29 @@ def process_input(
     messages.append({"role": "user", "content": user_input})
     emit("status", "THINKING")
 
-    llm_messages = messages
+    memory_block = None
     if memory is not None:
         try:
             recalled = memory.search(user_input)
             if recalled:
                 memory_block = "\n".join(f"- {m}" for m in recalled)
-                llm_messages = list(messages)
-                llm_messages[0] = {
-                    "role": "system",
-                    "content": messages[0]["content"]
-                    + "\n\nRelevant memories from past conversations:\n"
-                    + memory_block,
-                }
         except Exception as e:
             log_error(e)
             emit("log", f"Memory recall failed: {e}")
+
+    def llm_messages_for(msgs: list) -> list:
+        if memory_block is None:
+            return msgs
+        llm = list(msgs)
+        llm[0] = {
+            "role": "system",
+            "content": msgs[0]["content"]
+            + "\n\nRelevant memories from past conversations:\n"
+            + memory_block,
+        }
+        return llm
+
+    llm_messages = llm_messages_for(messages)
 
     emit("turn_start", user_input)
     interrupt_event.clear()
@@ -242,23 +277,8 @@ def process_input(
     interrupted = False
     interrupt_data: np.ndarray | None = None
     try:
-        response_stream = get_ai_response(
-            session=session,
-            messages=llm_messages,
-            llm_model=settings.LLM_MODEL,
-            llm_url=settings.LM_STUDIO_URL,
-            max_tokens=settings.MAX_TOKENS,
-            stream=True,
-        )
-
-        if not response_stream:
-            emit("log", "Failed to get AI response stream.")
-            return False, None
-
         audio_queue = AudioGenerationQueue(generator, speed)
         audio_queue.start()
-        chunker = TextChunker()
-        complete_response = []
 
         def worker_runner():
             nonlocal interrupted, interrupt_data
@@ -270,43 +290,73 @@ def process_input(
         playback_thread.daemon = True
         playback_thread.start()
 
-        for chunk in response_stream:
-            if interrupt_event.is_set():
-                emit("log", "[Command] Stop: stream aborted.")
-                break
-            data = parse_stream_chunk(chunk)
-            if not data or "choices" not in data:
+        retry = 0
+        bot_text = ""
+        while True:
+            response_stream = get_ai_response(
+                session=session,
+                messages=llm_messages,
+                llm_model=settings.LLM_MODEL,
+                llm_url=settings.LM_STUDIO_URL,
+                max_tokens=settings.MAX_TOKENS,
+                stream=True,
+            )
+
+            if not response_stream:
+                if not _retry_llm(messages, retry, "LLM request failed"):
+                    emit("log", "Failed to get AI response stream.")
+                    break
+                retry += 1
+                llm_messages = llm_messages_for(messages)
                 continue
 
-            choice = data["choices"][0]
-            if "delta" in choice and "content" in choice["delta"]:
-                content = choice["delta"]["content"]
-                if content:
-                    if not timing_info["llm_first_token"]:
-                        timing_info["llm_first_token"] = time.perf_counter()
-                    emit("bot_token", content)
-                    chunker.current_text.append(content)
+            chunker = TextChunker()
+            complete_response = []
+            for chunk in response_stream:
+                if interrupt_event.is_set():
+                    emit("log", "[Command] Stop: stream aborted.")
+                    break
+                data = parse_stream_chunk(chunk)
+                if not data or "choices" not in data:
+                    continue
 
-                    text = "".join(chunker.current_text)
-                    if chunker.should_process(text):
-                        if not timing_info["audio_queued"]:
-                            timing_info["audio_queued"] = time.perf_counter()
-                        remaining = chunker.process(text, audio_queue)
-                        chunker.current_text = [remaining] if remaining else []
-                        processed_len = len(text) - len(remaining)
-                        if processed_len > 0:
-                            complete_response.append(text[:processed_len])
+                choice = data["choices"][0]
+                if "delta" in choice and "content" in choice["delta"]:
+                    content = choice["delta"]["content"]
+                    if content:
+                        if not timing_info["llm_first_token"]:
+                            timing_info["llm_first_token"] = time.perf_counter()
+                        emit("bot_token", content)
+                        chunker.current_text.append(content)
 
-            if choice.get("finish_reason") == "stop":
+                        text = "".join(chunker.current_text)
+                        if chunker.should_process(text):
+                            if not timing_info["audio_queued"]:
+                                timing_info["audio_queued"] = time.perf_counter()
+                            remaining = chunker.process(text, audio_queue)
+                            chunker.current_text = [remaining] if remaining else []
+                            processed_len = len(text) - len(remaining)
+                            if processed_len > 0:
+                                complete_response.append(text[:processed_len])
+
+                if choice.get("finish_reason") == "stop":
+                    break
+
+            final_flushed = chunker.flush(audio_queue)
+            if final_flushed:
+                complete_response.append(final_flushed)
+
+            bot_text = " ".join(" ".join(complete_response).split())
+            if bot_text:
                 break
 
-        final_flushed = chunker.flush(audio_queue)
-        if final_flushed:
-            complete_response.append(final_flushed)
+            if not _retry_llm(messages, retry, "LLM returned empty (context too long?)"):
+                break
+            retry += 1
+            llm_messages = llm_messages_for(messages)
 
-        # collapse runs of whitespace left by raw streamed tokens
-        bot_text = " ".join(" ".join(complete_response).split())
-        messages.append({"role": "assistant", "content": bot_text})
+        if bot_text:
+            messages.append({"role": "assistant", "content": bot_text})
         print()
 
         audio_queue.stop()
@@ -433,8 +483,12 @@ def init_memory(mode: str) -> tuple[MemoryWorker, str]:
     return MemoryWorker(backend), label
 
 
+_last_idle_prompt = ""
+
+
 def pipeline_main():
     """Runs the voice-loop pipeline in a background thread; reports to the TUI."""
+    global _last_idle_prompt
     try:
         emit("status", "INITIALIZING")
         whisper_processor = whisper_model = None
@@ -617,7 +671,9 @@ def pipeline_main():
                         emit("transcript", "idle", prompt_text)
                     else:
                         idle_prompts = settings.get_idle_prompts_list()
-                        prompt_text = random.choice(idle_prompts)
+                        choices = [p for p in idle_prompts if p != _last_idle_prompt] or idle_prompts
+                        prompt_text = random.choice(choices)
+                        _last_idle_prompt = prompt_text
                         emit("log", f"[Random Idle Event] Picked prompt: '{prompt_text}'")
                         emit("transcript", "idle", prompt_text)
 
