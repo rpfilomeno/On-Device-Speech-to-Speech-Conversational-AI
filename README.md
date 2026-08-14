@@ -4,7 +4,7 @@ This is a real-time conversational system for two-way speech communication with 
 
 1. **Prerequisites:**
    - Install Python 3.8+ (tested with 3.12)
-   - Install [eSpeak NG](https://github.com/espeak-ng/espeak-ng/releases/tag/1.52.0) / `sudo apt install -y espeak-ng` for Linux (required for voice synthesis) [Linux user check this issue](https://github.com/asiff00/On-Device-Speech-to-Speech-Conversational-AI/issues/7#issuecomment-2661541707)
+   - Install [eSpeak NG](https://github.com/espeak-ng/espeak-ng/releases/tag/1.52.0) / `sudo apt install -y espeak-ng` for Linux (fallback TTS only; main TTS uses Kokoro) [Linux user check this issue](https://github.com/asiff00/On-Device-Speech-to-Speech-Conversational-AI/issues/7#issuecomment-2661541707)
    - Install Ollama from https://ollama.ai/
 
 2. **Setup:**
@@ -16,7 +16,7 @@ This is a real-time conversational system for two-way speech communication with 
    - Configure model repository IDs and target local directories in `.env`:
      - `WHISPER_MODEL_ID` / `WHISPER_MODEL_DIR`
      - `VAD_MODEL_ID` / `VAD_MODEL_DIR`
-   - Install requirements: `uv sync` (or `pip install -r requirements.txt`)
+   - Install requirements: `uv sync` (or `pip install -r requirements.txt` — a stale fallback)
    - _Note: Missing models are automatically downloaded from HuggingFace to local directories on first run._
 
 3. **Run Ollama:**
@@ -25,10 +25,26 @@ This is a real-time conversational system for two-way speech communication with 
 
 4. **Start Application:**
    - Run with `uv`: `uv run speech_to_speech.py` (or `python speech_to_speech.py`)
-   - Wait for initialization (models loading)
-   - Start talking when you see "Voice Chat Bot Ready"
-   - Long press `Ctrl+C` to stop the application
-   </details>
+   - The app opens a Textual TUI. **Voice input starts off** — VAD and Whisper models only load when you enable them.
+   - Type `/voice on` to start voice input (VAD + transcription), `/voice off` to disable it (unloads the models to free memory).
+   - Focus the text input with `t`, type a message, and press Enter to chat by text.
+   - Quit via the `System` menu → `(Q)uit` (or `/quit`).
+
+### Slash commands
+
+| Command | Description |
+| --- | --- |
+| `/voice` | Show VAD/voice-transcription status; `/voice on` or `/voice off` to toggle |
+| `/memory` | Show memory status; `/memory on` uses Qdrant long-term memory, `/memory off` uses in-RAM memory |
+| `/config` | Pick the microphone and speaker devices |
+| `/stop` | Interrupt the current playback / response |
+| `/pause` / `/play` | Suspend / resume voice output and the idle countdown |
+| `/now` | Trigger the idle event immediately |
+| `/slap` | Erase queued Twitch messages, or `/slap @user` for just theirs |
+| `/clear` | Clear the chat display |
+| `/help` | Show the command list |
+
+Long-term memory defaults to RAM (in-process, lost on exit); `/memory on` switches to persistent Qdrant storage.
 
 # How does it work?
 
