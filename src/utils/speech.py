@@ -409,6 +409,8 @@ class TurnAudioPlayer:
         self._interrupt = threading.Event()
         self._capture = None
         self._roll = []
+        self._last_hot = None
+        self._noise_floor = 0.0
         self._drain_event = threading.Event()
         self._stopped = False
 
@@ -446,13 +448,31 @@ class TurnAudioPlayer:
         if len(self._roll) > self._ROLL_BLOCKS:
             self._roll.pop(0)
         cap = self._capture
-        if float(np.abs(chunk).mean()) > settings.INTERRUPTION_THRESHOLD:
-            if not self._interrupt.is_set():
+        level = float(np.abs(chunk).mean())
+        # Noise-floor EMA on quiet blocks, so the trigger adapts to ambient level.
+        # Starts low (5% of the first block) and rises slowly, so a loud barge
+        # word never becomes its own noise floor.
+        self._noise_floor = min(
+            self._noise_floor * 0.95 + level * 0.05, level * 2
+        )
+        trigger = max(
+            settings.INTERRUPTION_THRESHOLD,
+            self._noise_floor * settings.BARGE_IN_NOISE_MARGIN,
+        )
+        if level > trigger:
+            # Debounce: require SPEECH_CHECK_TIMEOUT of sustained level, so
+            # short transients (clicks, claps) never barge in.
+            if self._last_hot is None:
+                self._last_hot = time.perf_counter()
+            if (
+                time.perf_counter() - self._last_hot >= settings.SPEECH_CHECK_TIMEOUT
+                and not self._interrupt.is_set()
+            ):
                 self._interrupt.set()
                 self._capture = cap = list(self._roll)
-            if cap is not None and len(cap) < self._CAP_BLOCKS:
-                cap.append(chunk.copy())
-        elif cap is not None and len(cap) < self._CAP_BLOCKS:
+        else:
+            self._last_hot = None
+        if cap is not None and len(cap) < self._CAP_BLOCKS:
             cap.append(chunk.copy())
 
     def _output_callback(self, outdata, frames, time_info, status):

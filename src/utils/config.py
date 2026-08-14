@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     MAX_SILENCE_DURATION: int = Field(default=1)
     SPEECH_CHECK_TIMEOUT: float = Field(default=0.1)
     SPEECH_CHECK_THRESHOLD: float = Field(default=0.005)
+    BARGE_IN_NOISE_MARGIN: float = Field(default=3.0)
     ROLLING_BUFFER_TIME: float = Field(default=0.5)
     TARGET_SIZE: int = Field(default=15)
     FIRST_SENTENCE_SIZE: int = Field(default=3)
