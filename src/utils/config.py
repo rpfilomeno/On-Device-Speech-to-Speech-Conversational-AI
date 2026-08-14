@@ -97,34 +97,46 @@ class Settings(BaseSettings):
         extra = "ignore"
 
 
-def _load_device_settings() -> dict:
-    """Load mic/speaker devices from settings.json; create the file if missing."""
-    if not SETTINGS_JSON.exists():
-        save_device_settings(settings.MIC_DEVICE, settings.SPEAKER_DEVICE)
-        return {}
+def _read_settings_json() -> dict:
+    """Load settings.json as a dict ({} if missing or corrupt)."""
     try:
-        data = json.loads(SETTINGS_JSON.read_text(encoding="utf-8"))
-        return {k: data.get(k, "") for k in ("MIC_DEVICE", "SPEAKER_DEVICE")}
+        return json.loads(SETTINGS_JSON.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
-def save_device_settings(mic: str, speaker: str) -> bool:
-    """Persist mic/speaker devices to settings.json (auto-created if missing)."""
+def save_settings(**values) -> bool:
+    """Merge the given values into settings.json, keeping any existing keys."""
     try:
+        data = _read_settings_json()
+        data.update(values)
         SETTINGS_JSON.write_text(
-            json.dumps({"MIC_DEVICE": mic, "SPEAKER_DEVICE": speaker}, indent=2) + "\n",
-            encoding="utf-8",
+            json.dumps(data, indent=2) + "\n", encoding="utf-8"
         )
         return True
     except Exception:
         return False
 
 
+def _load_device_settings() -> dict:
+    """Load settings.json; create the file (with device defaults) if missing."""
+    if not SETTINGS_JSON.exists():
+        save_device_settings(settings.MIC_DEVICE, settings.SPEAKER_DEVICE)
+        return {}
+    return _read_settings_json()
+
+
+def save_device_settings(mic: str, speaker: str) -> bool:
+    """Persist mic/speaker devices to settings.json (auto-created if missing)."""
+    return save_settings(MIC_DEVICE=mic, SPEAKER_DEVICE=speaker)
+
+
 settings = Settings()
-_devices = _load_device_settings()
-settings.MIC_DEVICE = _devices.get("MIC_DEVICE", settings.MIC_DEVICE)
-settings.SPEAKER_DEVICE = _devices.get("SPEAKER_DEVICE", settings.SPEAKER_DEVICE)
+_loaded = _load_device_settings()
+settings.MIC_DEVICE = _loaded.get("MIC_DEVICE", settings.MIC_DEVICE)
+settings.SPEAKER_DEVICE = _loaded.get("SPEAKER_DEVICE", settings.SPEAKER_DEVICE)
+settings.TARGET_SIZE = int(_loaded.get("TARGET_SIZE", settings.TARGET_SIZE))
+settings.PLAYBACK_DELAY = float(_loaded.get("PLAYBACK_DELAY", settings.PLAYBACK_DELAY))
 
 
 def log_error(exc: BaseException) -> Path:
