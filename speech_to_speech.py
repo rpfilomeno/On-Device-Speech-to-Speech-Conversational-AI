@@ -1,3 +1,4 @@
+import gc
 import logging
 import random
 import queue
@@ -52,6 +53,9 @@ pause_event = threading.Event()
 now_event = threading.Event()
 # /voice on/off: VAD + voice transcription listening (off by default)
 voice_event = threading.Event()
+# /memory on/off: Qdrant long-term memory on/off (RAM fallback when off); pipeline thread switches
+memory_request_queue: queue.Queue = queue.Queue()
+memory_status: dict[str, str | bool] = {"enabled": False, "backend": "RAM"}
 
 timing_info: dict[str, float | None] = {
     "vad_start": None,
@@ -403,16 +407,34 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     return was_interrupted, interrupt_audio
 
 
+def init_memory(mode: str) -> tuple[MemoryWorker, str]:
+    """Build a memory backend. mode='off' -> RAM; mode='on' -> Qdrant (RAM fallback). Returns (worker, label)."""
+    if mode != "on":
+        return MemoryWorker(RamMemory(settings.LM_STUDIO_URL, settings.EMBEDDING_MODEL)), "RAM"
+    try:
+        if not settings.QDRANT_HOST:
+            raise RuntimeError("QDRANT_HOST not set")
+        backend = Memory(
+            settings.QDRANT_HOST,
+            settings.LM_STUDIO_URL,
+            settings.EMBEDDING_MODEL,
+            collection=settings.QDRANT_COLLECTION,
+        )
+        backend.check()
+        label = f"Qdrant ({settings.QDRANT_HOST})"
+    except Exception as e:
+        backend = RamMemory(settings.LM_STUDIO_URL, settings.EMBEDDING_MODEL)
+        label = f"RAM (Qdrant unavailable: {e})"
+    return MemoryWorker(backend), label
+
+
 def pipeline_main():
     """Runs the voice-loop pipeline in a background thread; reports to the TUI."""
     try:
         emit("status", "INITIALIZING")
-        emit("log", "Initializing Whisper model...")
-        whisper_processor, whisper_model = init_whisper_model(
-            settings.WHISPER_MODEL_ID, settings.WHISPER_MODEL_DIR, hf_token=settings.HUGGINGFACE_TOKEN
-        )
-        emit("log", "Initializing Voice Activity Detection...")
-        vad_pipeline = init_vad_pipeline(settings.HUGGINGFACE_TOKEN)
+        whisper_processor = whisper_model = None
+        vad_pipeline = None
+        emit("log", "Voice input is OFF — VAD/Whisper models load on /voice on.")
         emit("log", "Initializing voice generator (Pocket TTS remote streaming)...")
         generator = VoiceGenerator()
         result = generator.initialize(
@@ -425,24 +447,9 @@ def pipeline_main():
         session = requests.Session()
         messages = [{"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT}]
 
-        memory = None
-        try:
-            if not settings.QDRANT_HOST:
-                raise RuntimeError("QDRANT_HOST not set")
-            backend = Memory(
-                settings.QDRANT_HOST,
-                settings.LM_STUDIO_URL,
-                settings.EMBEDDING_MODEL,
-                collection=settings.QDRANT_COLLECTION,
-            )
-            backend.check()
-            emit("log", f"Long-term memory: Qdrant ({settings.QDRANT_HOST}, collection '{settings.QDRANT_COLLECTION}')")
-        except Exception as e:
-            backend = RamMemory(settings.LM_STUDIO_URL, settings.EMBEDDING_MODEL)
-            emit("log", f"Long-term memory: Qdrant unavailable ({e}) — using RAM-only memory.")
-        if backend is not None:
-            memory = MemoryWorker(backend)
-            emit("log", "Long-term memory: embedding work runs on a background thread.")
+        memory, label = init_memory("off")
+        memory_status.update(enabled=False, backend=label)
+        emit("log", f"Long-term memory: {label} (use /memory on for Qdrant).")
 
         if settings.TWITCH_CLIENT_CHANNEL:
             emit("log", f"Starting Twitch chat collector for channel: {settings.TWITCH_CLIENT_CHANNEL}...")
@@ -496,10 +503,35 @@ def pipeline_main():
                 last_activity_time = time.time()
                 continue
 
+            try:
+                mem_cmd = memory_request_queue.get_nowait()
+            except queue.Empty:
+                mem_cmd = None
+            if mem_cmd == "on":
+                memory, label = init_memory("on")
+                memory_status.update(enabled=True, backend=label)
+                emit("log", f"[Memory] Long-term memory: {label}.")
+            elif mem_cmd == "off":
+                memory, label = init_memory("off")
+                memory_status.update(enabled=False, backend=label)
+                emit("log", f"[Memory] Long-term memory: {label}.")
+
             if not voice_event.is_set():
                 audio_data = None
                 time.sleep(0.1)
+                if vad_pipeline is not None:
+                    emit("log", "[Voice] VAD/Whisper models unloaded (use /voice on to reload).")
+                    whisper_processor = whisper_model = None
+                    vad_pipeline = None
+                    gc.collect()
             else:
+                if vad_pipeline is None:
+                    emit("log", "Initializing Whisper model...")
+                    whisper_processor, whisper_model = init_whisper_model(
+                        settings.WHISPER_MODEL_ID, settings.WHISPER_MODEL_DIR, hf_token=settings.HUGGINGFACE_TOKEN
+                    )
+                    emit("log", "Initializing Voice Activity Detection...")
+                    vad_pipeline = init_vad_pipeline(settings.HUGGINGFACE_TOKEN)
                 audio_data = record_continuous_audio(max_wait=1.0)
             if audio_data is not None:
                 speech_segments = detect_speech_segments(vad_pipeline, audio_data)
@@ -637,6 +669,7 @@ SLASH_COMMANDS = [
     ("/slap", "Erase queued Twitch messages, or /slap @user for just theirs"),
     ("/config", "Pick the microphone and speaker devices"),
     ("/voice", "Show voice-input status; /voice on|off enables/disables VAD + transcription"),
+    ("/memory", "Show memory status; /memory on|off toggles Qdrant long-term memory (RAM fallback)"),
     ("/help", "Show this list of slash commands"),
 ]
 
@@ -1088,6 +1121,7 @@ class SpeechTUI(App):
                 "/slap": self._cmd_slap,
                 "/config": self._cmd_config,
                 "/voice": self._cmd_voice,
+                "/memory": self._cmd_memory,
                 "/help": self._cmd_help,
             }.get(name)
             if handler:
@@ -1154,6 +1188,26 @@ class SpeechTUI(App):
         else:
             state = "ON" if voice_event.is_set() else "OFF"
             self._bot_reply(f"VAD and voice transcription are currently {state}.")
+
+    def _cmd_memory(self, arg=""):
+        arg = arg.strip().lower()
+        if arg == "on":
+            if memory_status["enabled"]:
+                self._bot_reply(f"Qdrant long-term memory is already ON ({memory_status['backend']}).")
+            else:
+                memory_request_queue.put("on")
+                self._bot_reply("Switching to Qdrant long-term memory...")
+        elif arg == "off":
+            if not memory_status["enabled"]:
+                self._bot_reply(f"Qdrant memory is already OFF — using {memory_status['backend']}.")
+            else:
+                memory_request_queue.put("off")
+                self._bot_reply("Switching to RAM memory...")
+        else:
+            if memory_status["enabled"]:
+                self._bot_reply(f"Qdrant long-term memory is ON ({memory_status['backend']}).")
+            else:
+                self._bot_reply(f"Qdrant long-term memory is OFF — using {memory_status['backend']}.")
 
     def _cmd_help(self, arg=""):
         self.push_screen(HelpScreen())
