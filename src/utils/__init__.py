@@ -4,7 +4,7 @@ from .llm import filter_response, get_ai_response
 from .audio_utils import save_audio_file, generate_and_play_sentences
 from .speech import (
     init_vad_pipeline, detect_speech_segments, record_audio,
-    record_continuous_audio, check_for_speech, play_audio_with_interrupt,
+    record_continuous_audio, check_for_speech, TurnAudioPlayer,
     transcribe_audio, init_whisper_model, ensure_model_downloaded,
     list_audio_devices,
 )
@@ -24,7 +24,7 @@ __all__ = [
     'record_audio',
     'record_continuous_audio',
     'check_for_speech',
-    'play_audio_with_interrupt',
+    'TurnAudioPlayer',
     'transcribe_audio',
     'init_whisper_model',
     'ensure_model_downloaded',

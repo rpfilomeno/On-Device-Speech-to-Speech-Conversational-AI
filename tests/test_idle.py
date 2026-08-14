@@ -43,29 +43,6 @@ def main():
     s.typing_pause_start = None
     assert abs(s._idle_elapsed() - 23) < 0.01, s._idle_elapsed()
 
-    # Adaptive playback: speed stays in [0.92, 1.0] and only reacts to real gaps
-    assert s._adaptive_speed(0.0) == 1.0
-    assert s._adaptive_speed(0.3) == 1.0
-    mid = s._adaptive_speed(1.4)
-    assert s._PLAY_SPEED_MIN < mid < 1.0
-    assert s._adaptive_speed(2.5) == s._PLAY_SPEED_MIN
-    assert s._adaptive_speed(10.0) == s._PLAY_SPEED_MIN
-
-    # Poll delay: minimal once behind, lazy otherwise
-    assert s._adaptive_poll_delay(0.0) == s._POLL_LAZY_DELAY
-    assert s._adaptive_poll_delay(1.0) == s.settings.PLAYBACK_DELAY
-
-    # Recovery easing: follows target while behind, then eases to 1.0 over 5 rounds
-    s._smoothed_speed = 1.0
-    s._ease_rounds_left = 0
-    assert s._recovery_speed(0.93) == 0.93
-    assert s._ease_rounds_left == 0
-    eased = [s._recovery_speed(1.0) for _ in range(5)]
-    assert eased[0] > 0.93 and eased[0] < 1.0, eased[0]
-    assert eased == sorted(eased), "easing must move monotonically toward 1.0"
-    assert eased[-1] == 1.0
-    assert s._recovery_speed(1.0) == 1.0
-
     print("test_idle: OK")
 
 

@@ -1,11 +1,11 @@
 import os
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 import pyaudio
 import numpy as np
 import torch
 from torch.nn.functional import pad
+import threading
 import time
 from queue import Queue
 import sounddevice as sd
@@ -380,87 +380,156 @@ def check_for_speech(timeout=0.1):
     return False, None
 
 
-def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None, monitor_input=True, speed=1.0):
-    """Plays audio while monitoring for speech interruption.
+class TurnAudioPlayer:
+    """Output (and optional barge-in input) streams kept open for an entire turn.
 
-    Args:
-        audio_data (np.ndarray): Audio data to play.
-        sample_rate (int, optional): Native sample rate of the audio. Defaults to 24000.
-        stop_events (list, optional): threading.Events that abort playback (like interruption).
-        monitor_input (bool, optional): Open the mic to detect barge-in. Defaults to True.
-        speed (float, optional): Output-rate multiplier. speed<1 plays slower (lower
-            pitch) without resampling, used to let TTS catch up when behind.
-
-    Returns:
-        tuple: A tuple containing a boolean indicating if playback was interrupted and None, or (False, None) if playback completes without interruption.
+    Chunks are queued FIFO and drained gaplessly by a single output callback, so
+    sentence boundaries never pay stream open/close overhead or click. The input
+    stream stays open too, so gaps between chunks are still monitored for
+    barge-in and capture the interrupting speech, instead of re-initializing
+    PyAudio on every loop iteration.
     """
-    stop_events = stop_events or []
-    play_rate = max(8000, int(sample_rate * speed))
-    interrupt_queue = Queue()
-    position = [0]
-    mic_device = _sd_device_index(settings.MIC_DEVICE, want_input=True)
-    spk_device = _sd_device_index(settings.SPEAKER_DEVICE, want_input=False)
 
-    def input_callback(indata, frames, time, status):
-        """Callback for monitoring input audio."""
-        if status:
-            print(f"Input status: {status}")
-            return
+    _DONE = object()
+    _ROLL_BLOCKS = max(4, int(settings.RATE * 0.5 / 1024))
+    _CAP_BLOCKS = max(16, int(settings.RATE * 3 / 1024))
 
-        audio_level = np.abs(indata[:, 0]).mean()
-        if audio_level > settings.INTERRUPTION_THRESHOLD:
-            print(f"\n[Interruption Detected] Audio Level: {audio_level:.4f} > {settings.INTERRUPTION_THRESHOLD}")
-            interrupt_queue.put(True)
+    def __init__(
+        self,
+        sample_rate: int = 24000,
+        stop_events=None,
+        monitor_input: bool = True,
+    ):
+        self._sample_rate = int(sample_rate)
+        self._stop_events = stop_events or []
+        self._q = Queue()
+        self._buf = None
+        self._pos = 0
+        self._playing = False
+        self._interrupt = threading.Event()
+        self._capture = None
+        self._roll = []
+        self._drain_event = threading.Event()
+        self._stopped = False
 
-    def output_callback(outdata, frames, time, status):
-        """Callback for output audio."""
-        if status:
-            print(f"Output status: {status}")
-            return
+        mic_device = _sd_device_index(settings.MIC_DEVICE, want_input=True)
+        spk_device = _sd_device_index(settings.SPEAKER_DEVICE, want_input=False)
 
-        if not interrupt_queue.empty() or any(e.is_set() for e in stop_events):
-            outdata.fill(0)
-            raise sd.CallbackStop()
-
-        remaining = len(audio_data) - position[0]
-        if remaining == 0:
-            outdata.fill(0)
-            raise sd.CallbackStop()
-        valid_frames = min(remaining, frames)
-        outdata[:valid_frames, 0] = audio_data[
-            position[0] : position[0] + valid_frames
-        ]
-        if valid_frames < frames:
-            outdata[valid_frames:] = 0
-        position[0] += valid_frames
-
-    try:
-        input_stream = (
-            sd.InputStream(
-                channels=1, callback=input_callback, samplerate=settings.RATE, device=mic_device
-            )
-            if monitor_input
-            else nullcontext()
+        self._out: Optional[sd.OutputStream] = None
+        self._in: Optional[sd.InputStream] = None
+        self._out = sd.OutputStream(
+            channels=1, callback=self._output_callback,
+            samplerate=self._sample_rate, device=spk_device, blocksize=1024,
         )
-        with input_stream:
-            with sd.OutputStream(
-                channels=1, callback=output_callback, samplerate=play_rate, device=spk_device,
-                blocksize=1024,
-            ):
-                while position[0] < len(audio_data):
-                    sd.sleep(50)
-                    if not interrupt_queue.empty() or any(e.is_set() for e in stop_events):
-                        return True, None
-        
-        is_interrupted = not interrupt_queue.empty()
-        return is_interrupted, None
-    except sd.CallbackStop:
-        is_interrupted = not interrupt_queue.empty()
-        return is_interrupted, None
-    except Exception as e:
-        log_error(e)
-        print(f"Error during playback: {str(e)}")
-        return False, None
+        self._out.start()
+        if monitor_input:
+            # Optional: a mic problem must never kill playback, only disable barge-in.
+            try:
+                self._in = sd.InputStream(
+                    channels=1, callback=self._input_callback,
+                    samplerate=settings.RATE, device=mic_device, blocksize=1024,
+                )
+                self._in.start()
+            except Exception as e:
+                log_error(e)
+                self._in = None
+
+    # ---- callbacks (PortAudio threads) ----
+
+    def _input_callback(self, indata, frames, time_info, status):
+        # Only detect barge-in while audio is actually playing; ambient noise
+        # during the LLM "thinking" phase must not kill the turn.
+        if status or not self._playing:
+            return
+        chunk = indata[:, 0]
+        self._roll.append(chunk.copy())
+        if len(self._roll) > self._ROLL_BLOCKS:
+            self._roll.pop(0)
+        cap = self._capture
+        if float(np.abs(chunk).mean()) > settings.INTERRUPTION_THRESHOLD:
+            if not self._interrupt.is_set():
+                self._interrupt.set()
+                self._capture = cap = list(self._roll)
+            if cap is not None and len(cap) < self._CAP_BLOCKS:
+                cap.append(chunk.copy())
+        elif cap is not None and len(cap) < self._CAP_BLOCKS:
+            cap.append(chunk.copy())
+
+    def _output_callback(self, outdata, frames, time_info, status):
+        if self._stopped or self._interrupt.is_set() or any(e.is_set() for e in self._stop_events):
+            outdata.fill(0)
+            raise sd.CallbackStop
+        out = []
+        need = frames
+        while need > 0:
+            if self._buf is not None and self._pos < len(self._buf):
+                take = min(need, len(self._buf) - self._pos)
+                out.append(self._buf[self._pos : self._pos + take])
+                self._pos += take
+                need -= take
+            else:
+                try:
+                    item = self._q.get_nowait()
+                except Exception:
+                    break
+                if item is TurnAudioPlayer._DONE:
+                    self._drain_event.set()
+                    break
+                self._buf = item
+                self._pos = 0
+        data = np.concatenate(out) if out else np.empty(0, dtype=np.float32)
+        n = min(frames, len(data))
+        outdata[:n, 0] = data[:n]
+        if n < frames:
+            outdata[n:, 0] = 0
+
+    # ---- worker thread API ----
+
+    def push(self, chunk: np.ndarray):
+        """Queue a chunk for gapless playback; returns immediately."""
+        if self._stopped or self._interrupt.is_set():
+            return
+        if not self._playing:
+            self._playing = True
+            self._roll = []
+        self._q.put(chunk)
+
+    def is_interrupted(self) -> bool:
+        """True once barge-in speech or a stop event has halted playback."""
+        return self._interrupt.is_set() or any(e.is_set() for e in self._stop_events)
+
+    def is_playing(self) -> bool:
+        """True while audio is still queued or actively playing."""
+        if not self._q.empty():
+            return True
+        return self._buf is not None and self._pos < len(self._buf)
+
+    def take_capture(self) -> Optional[np.ndarray]:
+        """Return audio captured from barge-in onset (for re-transcription)."""
+        cap, self._capture = self._capture, None
+        if cap:
+            return np.concatenate(cap)
+        return None
+
+    def flush(self):
+        """Wait until everything pushed so far has been played."""
+        if self._stopped or self.is_interrupted():
+            return
+        self._drain_event.clear()
+        self._q.put(TurnAudioPlayer._DONE)
+        while not self._drain_event.is_set() and not self.is_interrupted():
+            self._drain_event.wait(timeout=0.05)
+
+    def stop(self):
+        self._stopped = True
+        for s in (self._out, self._in):
+            if s is not None:
+                try:
+                    s.stop()
+                    s.close()
+                except Exception:
+                    pass
+        self._out = self._in = None
 
 
 def transcribe_audio(processor, model, audio_data, sampling_rate=None):

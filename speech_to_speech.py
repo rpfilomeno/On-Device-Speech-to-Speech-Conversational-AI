@@ -16,17 +16,16 @@ from src.utils.config import settings, save_device_settings, log_error
 from src.utils import (
     VoiceGenerator,
     get_ai_response,
-    play_audio_with_interrupt,
     init_vad_pipeline,
     init_whisper_model,
     detect_speech_segments,
     record_continuous_audio,
-    check_for_speech,
     transcribe_audio,
     list_audio_devices,
     twitch_collector,
     twitch_bot_manager,
 )
+from src.utils.speech import TurnAudioPlayer
 from src.utils.audio_queue import AudioGenerationQueue
 from src.utils.llm import parse_stream_chunk
 from src.utils.memory import Memory, MemoryWorker, RamMemory
@@ -335,6 +334,7 @@ def process_input(
                         chunker.current_text.append(content)
 
                         text = "".join(chunker.current_text)
+                        settings.TARGET_SIZE = _adaptive_target_words()
                         if chunker.should_process(text):
                             if not timing_info["audio_queued"]:
                                 timing_info["audio_queued"] = time.perf_counter()
@@ -347,6 +347,7 @@ def process_input(
                 if choice.get("finish_reason") == "stop":
                     break
 
+            settings.TARGET_SIZE = _adaptive_target_words()
             final_flushed = chunker.flush(audio_queue)
             if final_flushed:
                 complete_response.append(final_flushed)
@@ -390,15 +391,14 @@ def process_input(
         return False, None
 
 
-# Adaptive playback: when TTS synthesis falls behind the player, we slow the
-# output rate slightly (gives TTS time to finish the next chunk) and poll
-# faster so the chunk is grabbed the instant it's ready. The rate stays within
-# natural speech-tempo variation -- sub-300ms gaps are imperceptible and never
-# trigger a change, and the floor is 0.92x (an 8% slowdown is heard as a
-# casual tempo shift, not robot-slow speech).
-_PLAY_SPEED_MIN = 0.92
-_PLAY_SPEED_RAMP_START = 0.3
-_PLAY_SPEED_RAMP_END = 2.5
+# Adaptive chunking: when TTS synthesis falls behind the player, shrink the
+# words-per-chunk target so sentences synthesize faster (fewer words = shorter
+# audio = less time behind), and poll fast so the next chunk is grabbed the
+# instant it's ready. The chunk size eases the same way the old playback-speed
+# recovery did: smooth descent, cubic ease-out back to full size.
+_TARGET_MIN = 6
+_TARGET_RAMP_START = 0.3
+_TARGET_RAMP_END = 2.5
 _BEHIND_EMA_ALPHA = 0.3
 _BEHIND_DECAY = 0.8
 _POLL_LAZY_DELAY = 0.05
@@ -407,23 +407,51 @@ _POLL_BEHIND_THRESHOLD = 0.5
 # Persistent across turns (until app exit): a turn that starts slow already
 # carries the previous adaptation instead of re-learning the first gap.
 _behind_ema = 0.0
-_was_slowed = False
-# Speed is eased back to 1.0 over _EASE_ROUNDS chunks once TTS has caught up,
-# so the last stretch of recovery never snaps audibly.
 _EASE_ROUNDS = 5
-_smoothed_speed = 1.0
+_smoothed_target: float | None = None
 _ease_rounds_left = 0
-_ease_start_speed = 1.0
+_ease_start_value = 0.0
 
 
-def _adaptive_speed(behind_ema: float) -> float:
-    """Output-rate multiplier in [0.92, 1.0] based on the average gap behind."""
-    if behind_ema <= _PLAY_SPEED_RAMP_START:
-        return 1.0
-    if behind_ema >= _PLAY_SPEED_RAMP_END:
-        return _PLAY_SPEED_MIN
-    t = (behind_ema - _PLAY_SPEED_RAMP_START) / (_PLAY_SPEED_RAMP_END - _PLAY_SPEED_RAMP_START)
-    return 1.0 - t * (1.0 - _PLAY_SPEED_MIN)
+def _target_for(behind_ema: float) -> float:
+    """Raw words-per-chunk target for a given behind-average."""
+    full = float(settings.TARGET_SIZE)
+    if behind_ema <= _TARGET_RAMP_START:
+        return full
+    if behind_ema >= _TARGET_RAMP_END:
+        return float(_TARGET_MIN)
+    t = (behind_ema - _TARGET_RAMP_START) / (_TARGET_RAMP_END - _TARGET_RAMP_START)
+    return full - t * (full - _TARGET_MIN)
+
+
+def _ease_to(current: float, target: float) -> float:
+    """Ease `current` toward `target`: smooth descent, 5-round cubic ease-out
+    on recovery (the scheme the playback-speed recovery used)."""
+    global _ease_rounds_left, _ease_start_value
+    if abs(target - current) < 0.05:
+        _ease_rounds_left = 0
+        return target
+    if target < current:
+        _ease_rounds_left = 0
+        return current + 0.5 * (target - current)
+    if _ease_rounds_left == 0:
+        _ease_start_value = current
+        _ease_rounds_left = _EASE_ROUNDS
+    _ease_rounds_left = max(0, _ease_rounds_left - 1)
+    progress = 1.0 - _ease_rounds_left / _EASE_ROUNDS
+    eased = 1.0 - (1.0 - progress) ** 3
+    return _ease_start_value + (target - _ease_start_value) * eased
+
+
+def _adaptive_target_words() -> int:
+    """Current eased words-per-chunk target, driven by the behind-average."""
+    global _smoothed_target
+    target = _target_for(_behind_ema)
+    if _smoothed_target is None:
+        _smoothed_target = target
+    else:
+        _smoothed_target = _ease_to(_smoothed_target, target)
+    return int(round(_smoothed_target))
 
 
 def _adaptive_poll_delay(behind_ema: float) -> float:
@@ -433,32 +461,11 @@ def _adaptive_poll_delay(behind_ema: float) -> float:
     return _POLL_LAZY_DELAY
 
 
-def _recovery_speed(target: float) -> float:
-    """Playback speed to use, easing back to 1.0 over _EASE_ROUNDS chunks.
-
-    While synthesis is still behind (target < 1.0) we follow the target
-    directly. Once it has caught up, the speed eases from its last slowed value
-    to 1.0 with a cubic ease-out (big lift first, gentle settling), so the
-    return to normal never snaps."""
-    global _smoothed_speed, _ease_rounds_left, _ease_start_speed
-    if target < 1.0:
-        _smoothed_speed = target
-        _ease_rounds_left = 0
-        return target
-    if _smoothed_speed >= 1.0:
-        return 1.0
-    if _ease_rounds_left == 0:
-        _ease_start_speed = _smoothed_speed
-        _ease_rounds_left = _EASE_ROUNDS
-    _ease_rounds_left = max(0, _ease_rounds_left - 1)
-    progress = 1.0 - _ease_rounds_left / _EASE_ROUNDS
-    eased = 1.0 - (1.0 - progress) ** 3
-    _smoothed_speed = _ease_start_speed + (1.0 - _ease_start_speed) * eased
-    return _smoothed_speed
-
-
 def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     """Manages audio playback in a separate thread, handling interruptions.
+
+    One TurnAudioPlayer stays open for the whole turn: gapless chunk playback,
+    continuous barge-in monitoring, and a single stop/clear path.
 
     Args:
         audio_queue (AudioGenerationQueue): The audio queue object.
@@ -466,7 +473,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     Returns:
         tuple[bool, None]: A tuple containing a boolean indicating if the playback was interrupted and the interrupt audio data.
     """
-    global timing_info, _behind_ema, _was_slowed
+    global timing_info, _behind_ema
     was_interrupted = False
     interrupt_audio = None
 
@@ -474,25 +481,41 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     wait_start = None
 
     try:
+        player = TurnAudioPlayer(
+            stop_events=[interrupt_event, pause_event],
+            monitor_input=voice_event.is_set(),
+        )
+    except Exception as e:
+        log_error(e)
+        emit("log", f"Error opening audio player: {str(e)}")
+        return False, None
+
+    try:
         while True:
             if interrupt_event.is_set():
                 interrupt_event.clear()
                 emit("log", "[Command] Stop: playback interrupted, clearing queues.")
+                player.stop()
                 audio_queue.clear_queues()
                 break
             if pause_event.is_set():
                 audio_queue.clear_queues()
+                player.stop()
                 time.sleep(settings.PLAYBACK_DELAY)
                 continue
-
-            if audio_queue.audio_queue.empty() and voice_event.is_set():
-                speech_detected, audio_data = check_for_speech()
-                if speech_detected:
-                    was_interrupted = True
-                    interrupt_audio = audio_data
+            if player.is_interrupted():
+                was_interrupted = True
+                if pause_event.is_set():
+                    emit("log", "[Command] Pause: playback suspended.")
+                elif interrupt_event.is_set():
+                    interrupt_event.clear()
+                    emit("log", "[Command] Stop: playback interrupted, clearing queues.")
+                else:
+                    interrupt_audio = player.take_capture()
                     emit("log", "[TTS Interrupted] Speech detected from microphone! Clearing audio queues...")
-                    audio_queue.clear_queues()
-                    break
+                player.stop()
+                audio_queue.clear_queues()
+                break
 
             audio_data, sentence, is_first = audio_queue.get_next_audio()
             if audio_data is not None:
@@ -502,13 +525,6 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                     wait_start = None
                 else:
                     _behind_ema *= _BEHIND_DECAY
-                play_speed = _recovery_speed(_adaptive_speed(_behind_ema))
-                slowed = play_speed < 0.999
-                if slowed and not _was_slowed:
-                    emit("log", f"[TTS] Synthesis behind by ~{_behind_ema:.2f}s — slowing playback to {play_speed:.2f}x.")
-                elif not slowed and _was_slowed:
-                    emit("log", "[TTS] Synthesis caught up — playback back to normal speed.")
-                _was_slowed = slowed
                 played_any = True
                 if not timing_info["first_audio_play"]:
                     timing_info["first_audio_play"] = time.perf_counter()
@@ -519,22 +535,9 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                     _append_chat_file("out.txt", sentence)
                 if settings.LOG_TTS_CHUNKS:
                     emit("log", f"[TTS Playing] {sentence!r}")
-                was_interrupted, interrupt_data = play_audio_with_interrupt(
-                    audio_data, stop_events=[interrupt_event, pause_event], monitor_input=voice_event.is_set(), speed=play_speed
-                )
-                if was_interrupted:
-                    interrupt_audio = interrupt_data
-                    if pause_event.is_set():
-                        emit("log", "[Command] Pause: playback suspended.")
-                    elif interrupt_event.is_set():
-                        interrupt_event.clear()
-                        emit("log", "[Command] Stop: playback interrupted, clearing queues.")
-                    else:
-                        emit("log", "[TTS Interrupted] Interrupted during playback! Clearing audio queues...")
-                    audio_queue.clear_queues()
-                    break
+                player.push(audio_data)
             else:
-                if played_any and wait_start is None:
+                if played_any and wait_start is None and not player.is_playing():
                     wait_start = time.time()
                 time.sleep(_adaptive_poll_delay(_behind_ema))
 
@@ -543,11 +546,14 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                 and audio_queue.sentence_queue.empty()
                 and audio_queue.audio_queue.empty()
             ):
+                player.flush()
                 break
 
     except Exception as e:
         log_error(e)
         emit("log", f"Error in audio playback: {str(e)}")
+    finally:
+        player.stop()
 
     return was_interrupted, interrupt_audio
 
