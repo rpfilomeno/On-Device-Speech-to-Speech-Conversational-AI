@@ -195,14 +195,17 @@ def _restore_error_routing():
 _TRIM_GRACE_RETRIES = 2  # transient failures don't shrink context; trim only after this many consecutive retries
 
 
-def _trim_history(messages: list, drop_turns: int) -> bool:
-    """Drop the oldest `drop_turns` completed turns from the middle of the
-    conversation (keeps the system prompt and the current user message), so each
-    retry sends a smaller context. Returns True if anything was dropped."""
-    n_drop = min(2 * drop_turns, len(messages) - 2)
-    if n_drop < 2:
+def _trim_history(messages: list) -> bool:
+    """Drop a random contiguous block of the completed turns (a random 20-50%
+    of the middle, at a random position), keeping the system prompt and the
+    current user message, so each retry sends a smaller context. Returns True
+    if anything was dropped."""
+    middle_len = len(messages) - 2
+    if middle_len < 2:
         return False
-    del messages[1:1 + n_drop]
+    n_drop = max(1, int(middle_len * random.uniform(0.2, 0.5)))
+    start = random.randint(0, middle_len - n_drop)
+    del messages[1 + start:1 + start + n_drop]
     return True
 
 
@@ -212,7 +215,7 @@ def _retry_llm(messages: list, retry: int, reason: str) -> bool:
     trimming older turns so the context can actually shrink. Returns True if a
     retry is worth another attempt."""
     if retry >= _TRIM_GRACE_RETRIES:
-        if not _trim_history(messages, 1 + (retry - _TRIM_GRACE_RETRIES)):
+        if not _trim_history(messages):
             return False
         emit("log", f"{reason} - trimmed history and retrying.")
     else:
