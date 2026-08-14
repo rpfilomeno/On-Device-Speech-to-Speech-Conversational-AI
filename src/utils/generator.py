@@ -6,7 +6,7 @@ import requests
 import numpy as np
 import soundfile as sf
 from pathlib import Path
-from .config import settings
+from .config import settings, log_error
 
 
 class VoiceGenerator:
@@ -94,6 +94,7 @@ class VoiceGenerator:
                 return (audio_data, []) if not return_chunks else ([audio_data], [])
             except Exception as e:
                 last_error = e
+                log_error(e)
                 logging.warning(f"Pocket TTS attempt {attempt}/{max_retries} failed: {str(e)}")
                 if attempt < max_retries:
                     time.sleep(0.5)

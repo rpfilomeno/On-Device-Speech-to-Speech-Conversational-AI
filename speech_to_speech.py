@@ -12,7 +12,7 @@ import numpy as np
 import requests
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-from src.utils.config import settings, save_device_settings
+from src.utils.config import settings, save_device_settings, log_error
 from src.utils import (
     VoiceGenerator,
     get_ai_response,
@@ -232,6 +232,7 @@ def process_input(
                     + memory_block,
                 }
         except Exception as e:
+            log_error(e)
             emit("log", f"Memory recall failed: {e}")
 
     emit("turn_start", user_input)
@@ -321,11 +322,13 @@ def process_input(
                 memory.store("user", user_input)
                 memory.store("assistant", bot_text)
             except Exception as e:
+                log_error(e)
                 emit("log", f"Memory store failed: {e}")
         emit("status", "LISTENING")
         return interrupted, interrupt_data
 
     except Exception as e:
+        log_error(e)
         emit("log", f"Error during streaming: {str(e)}")
         if audio_queue is not None:
             audio_queue.stop()
@@ -402,6 +405,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                 break
 
     except Exception as e:
+        log_error(e)
         emit("log", f"Error in audio playback: {str(e)}")
 
     return was_interrupted, interrupt_audio
@@ -423,6 +427,7 @@ def init_memory(mode: str) -> tuple[MemoryWorker, str]:
         backend.check()
         label = f"Qdrant ({settings.QDRANT_HOST})"
     except Exception as e:
+        log_error(e)
         backend = RamMemory(settings.LM_STUDIO_URL, settings.EMBEDDING_MODEL)
         label = f"RAM (Qdrant unavailable: {e})"
     return MemoryWorker(backend), label
@@ -471,6 +476,7 @@ def pipeline_main():
             if not response_stream:
                 emit("log", "Failed to initialize the AI model!")
         except requests.RequestException as e:
+            log_error(e)
             emit("log", f"Warmup failed: {str(e)}")
 
         emit("status", "LISTENING")
@@ -625,6 +631,7 @@ def pipeline_main():
                         session.connection_pool.clear()
 
     except Exception as e:
+        log_error(e)
         emit("error", f"{type(e).__name__}: {str(e)}")
         emit("log", traceback.format_exc())
 
@@ -704,6 +711,7 @@ class ChatInput(Input):
         try:
             self.screen.set_focus(None)
         except Exception as e:
+            log_error(e)
             emit("error", f"unfocus error: {type(e).__name__}: {e}")
 
     def on_input_changed(self, event: Input.Changed):
@@ -751,6 +759,7 @@ class ChatInput(Input):
                 self.value = ""
         except Exception as e:
             # never raise out of a message handler (Textual would panic the app)
+            log_error(e)
             emit("error", f"text input error: {type(e).__name__}: {e}")
 
     def action_suggestion(self, delta: int):
@@ -1129,6 +1138,7 @@ class SpeechTUI(App):
             else:
                 self._notice(f"Unknown command: {raw}", color="bold red")
         except Exception as e:
+            log_error(e)
             self._log_tui_error("command", e)
 
     def _cmd_quit(self, arg=""):
@@ -1313,6 +1323,7 @@ class SpeechTUI(App):
                 parts.append(timing)
             self.status_bar.update("  │  ".join(parts))
         except Exception as e:
+            log_error(e)
             self._log_tui_error("status bar", e)
         self._update_idle_pane()
 
@@ -1330,6 +1341,7 @@ class SpeechTUI(App):
                 f"Last activity: {time.strftime('%H:%M:%S', time.localtime(self.last_activity))}"
             )
         except Exception as e:
+            log_error(e)
             self._log_tui_error("idle pane", e)
 
     # ---- event handling ----
@@ -1344,6 +1356,7 @@ class SpeechTUI(App):
         try:
             self._update_twitch()
         except Exception as e:
+            log_error(e)
             self._log_tui_error("twitch panel", e)
 
     def _log_tui_error(self, context: str, error: Exception):
@@ -1393,6 +1406,7 @@ class SpeechTUI(App):
             elif kind == "error":
                 self._notice(payload[0], color="bold red")
         except Exception as e:
+            log_error(e)
             self._log_tui_error("event handler", e)
 
     def _log_notice(self, line: str):

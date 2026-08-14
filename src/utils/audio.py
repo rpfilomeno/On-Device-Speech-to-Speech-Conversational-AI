@@ -2,6 +2,8 @@ import numpy as np
 import sounddevice as sd
 import time
 
+from .config import settings, log_error
+
 
 def play_audio(audio_data: np.ndarray, sample_rate: int = 24000):
     """
@@ -15,6 +17,7 @@ def play_audio(audio_data: np.ndarray, sample_rate: int = 24000):
         sd.play(audio_data, sample_rate)
         sd.wait()
     except Exception as e:
+        log_error(e)
         print(f"Error playing audio: {str(e)}")
 
 
@@ -37,6 +40,7 @@ def stream_audio_chunks(
             sd.wait()
             time.sleep(pause_duration)
     except Exception as e:
+        log_error(e)
         print(f"Error streaming audio chunks: {str(e)}")
     finally:
         sd.stop()

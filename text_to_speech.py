@@ -3,7 +3,7 @@ import time
 import requests
 import signal
 import sys
-from src.utils.config import settings
+from src.utils.config import settings, log_error
 from src.utils import (
     VoiceGenerator,
     get_ai_response,
@@ -122,6 +122,7 @@ def process_input(
         print_timing_chart(timing_info)
 
     except Exception as e:
+        log_error(e)
         print(f"\nError during streaming: {str(e)}")
         if audio_queue is not None:
             audio_queue.stop()
@@ -156,6 +157,7 @@ def audio_playback_worker(audio_queue) -> None:
                 break
 
     except Exception as e:
+        log_error(e)
         print(f"Error in audio playback: {str(e)}")
 
 
@@ -218,6 +220,7 @@ def main():
                     print("Failed to initialize the AI model!")
                     return
             except requests.RequestException as e:
+                log_error(e)
                 print(f"Warmup failed: {str(e)}")
 
             print("\n=== Text-to-Speech Chat Bot Ready ===")
@@ -244,10 +247,12 @@ def main():
                     print("\nStopping...")
                     break
                 except Exception as e:
+                    log_error(e)
                     print(f"Error: {str(e)}")
                     continue
 
         except Exception as e:
+            log_error(e)
             print(f"Error: {str(e)}")
             print("\nFull traceback:")
             traceback.print_exc()

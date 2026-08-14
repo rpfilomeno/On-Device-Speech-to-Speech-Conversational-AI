@@ -127,6 +127,24 @@ settings.MIC_DEVICE = _devices.get("MIC_DEVICE", settings.MIC_DEVICE)
 settings.SPEAKER_DEVICE = _devices.get("SPEAKER_DEVICE", settings.SPEAKER_DEVICE)
 
 
+def log_error(exc: BaseException) -> Path:
+    """Write an exception with its full traceback to output/error/<timestamp>.log.
+
+    Must be called from inside an except block so the traceback is captured.
+    """
+    import traceback
+    from datetime import datetime
+
+    error_dir = settings.OUTPUT_DIR / "error"
+    error_dir.mkdir(parents=True, exist_ok=True)
+    path = error_dir / f"error_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
+    path.write_text(
+        f"[{datetime.now().isoformat()}] {type(exc).__name__}: {exc}\n\n{traceback.format_exc()}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def configure_logging():
     """Configure logging to suppress all logs"""
     import logging

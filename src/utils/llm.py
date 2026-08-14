@@ -2,7 +2,9 @@ import re
 import requests
 import json
 import time
-from src.utils.config import settings
+from src.utils.config import settings, log_error
+
+_last_parse_error_time: float | None = None
 
 
 def filter_response(response: str) -> str:
@@ -52,6 +54,7 @@ def warmup_llm(session: requests.Session, llm_model: str, llm_url: str):
         if res.status_code != 200:
             print(f"LLM warmup status code: {res.status_code}")
     except requests.RequestException as e:
+        log_error(e)
         print(f"Warmup failed: {str(e)}")
 
 
@@ -102,18 +105,20 @@ def get_ai_response(
         def streaming_iterator():
             """Iterates over the streaming response."""
             try:
-                for chunk in response.iter_content(chunk_size=512):
-                    if chunk:
-                        yield chunk
+                for line in response.iter_lines():
+                    if line:
+                        yield line
                     else:
-                        yield b"\x00\x00"
+                        yield b""
             except Exception as e:
+                log_error(e)
                 print(f"\nError: {str(e)}")
-                yield b"\x00\x00"
+                yield b""
 
         return streaming_iterator()
 
     except Exception as e:
+        log_error(e)
         print(f"\nError: {str(e)}")
 
 
@@ -151,6 +156,10 @@ def parse_stream_chunk(chunk: bytes) -> dict | None:
         return None
 
     except Exception as e:
+        global _last_parse_error_time
+        if _last_parse_error_time is None or time.time() - _last_parse_error_time > 10:
+            log_error(e)
+            _last_parse_error_time = time.time()
         if str(e) != "Expecting value: line 1 column 2 (char 1)":
             print(f"Error parsing stream chunk: {str(e)}")
         return None

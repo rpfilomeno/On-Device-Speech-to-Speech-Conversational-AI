@@ -5,7 +5,7 @@ from typing import Optional, Tuple, List
 import numpy as np
 import logging
 
-from .config import settings
+from .config import settings, log_error
 
 logging.getLogger("phonemizer").setLevel(logging.ERROR)
 logging.getLogger("speechbrain.utils.quirks").setLevel(logging.ERROR)
@@ -172,6 +172,7 @@ class AudioGenerationQueue:
                     if settings.LOG_TTS_CHUNKS:
                         print(f"[TTS Synthesized] Chunk #{self.audio_generated} successfully: {sentence!r}")
                 except Exception as e:
+                    log_error(e)
                     error_msg = str(e)
                     if settings.LOG_TTS_CHUNKS:
                         print(f"[TTS Error] Failed chunk #{self.sentences_processed} {sentence!r}: {error_msg}")
@@ -181,6 +182,7 @@ class AudioGenerationQueue:
                     self.is_generating = False
 
             except Exception as e:
+                log_error(e)
                 if not self.is_running and self.sentence_queue.empty():
                     break
                 time.sleep(0.1)

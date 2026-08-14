@@ -3,7 +3,7 @@ import threading
 import time
 from collections import deque
 import twitch
-from src.utils.config import settings
+from src.utils.config import settings, log_error
 
 
 class TwitchEventCollector:
@@ -102,6 +102,7 @@ class TwitchBotManager:
                 oauth="SCHMOOPIIE",
             )
         except Exception as e:
+            log_error(e)
             print(f"[Twitch Bot Error] {e}")
             return
 

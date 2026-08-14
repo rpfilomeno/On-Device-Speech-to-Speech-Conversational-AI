@@ -9,6 +9,8 @@ import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
+from .config import log_error
+
 # Only recall memories that are at least this semantically similar to the query.
 MIN_SCORE = 0.4
 
@@ -155,6 +157,7 @@ class MemoryWorker:
                 else:
                     job["result"].extend(self._memory.search(job["query"], job["limit"]))
             except Exception as e:
+                log_error(e)
                 if job["op"] == "recall":
                     job["error"] = str(e)
                 else:

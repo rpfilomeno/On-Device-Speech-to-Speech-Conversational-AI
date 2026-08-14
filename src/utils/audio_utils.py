@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple, Callable
 import numpy as np
 from .audio_io import save_audio_file, play_audio
 from .audio_queue import AudioGenerationQueue
+from .config import log_error
 
 
 def generate_and_play_sentences(
@@ -67,6 +68,7 @@ def generate_and_play_sentences(
                             interrupt_audio = interrupt_data
                             break
                     except Exception as e:
+                        log_error(e)
                         print(f"Error playing audio: {str(e)}")
                         continue
 
@@ -76,6 +78,7 @@ def generate_and_play_sentences(
             time.sleep(0.01)
 
     except Exception as e:
+        log_error(e)
         print(f"Error in generate_and_play_sentences: {str(e)}")
     finally:
         audio_queue.stop()

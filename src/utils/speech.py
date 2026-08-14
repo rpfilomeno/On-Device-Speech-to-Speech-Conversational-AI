@@ -9,7 +9,7 @@ from torch.nn.functional import pad
 import time
 from queue import Queue
 import sounddevice as sd
-from .config import settings
+from .config import settings, log_error
 
 CHUNK = settings.CHUNK
 FORMAT = pyaudio.paFloat32
@@ -452,6 +452,7 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None, m
         is_interrupted = not interrupt_queue.empty()
         return is_interrupted, None
     except Exception as e:
+        log_error(e)
         print(f"Error during playback: {str(e)}")
         return False, None
 
