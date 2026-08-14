@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 import pyaudio
@@ -379,13 +380,14 @@ def check_for_speech(timeout=0.1):
     return False, None
 
 
-def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None):
+def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None, monitor_input=True):
     """Plays audio while monitoring for speech interruption.
 
     Args:
         audio_data (np.ndarray): Audio data to play.
         sample_rate (int, optional): Sample rate for playback. Defaults to 24000.
         stop_events (list, optional): threading.Events that abort playback (like interruption).
+        monitor_input (bool, optional): Open the mic to detect barge-in. Defaults to True.
 
     Returns:
         tuple: A tuple containing a boolean indicating if playback was interrupted and None, or (False, None) if playback completes without interruption.
@@ -428,9 +430,14 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None):
         position[0] += valid_frames
 
     try:
-        with sd.InputStream(
-            channels=1, callback=input_callback, samplerate=settings.RATE, device=mic_device
-        ):
+        input_stream = (
+            sd.InputStream(
+                channels=1, callback=input_callback, samplerate=settings.RATE, device=mic_device
+            )
+            if monitor_input
+            else nullcontext()
+        )
+        with input_stream:
             with sd.OutputStream(
                 channels=1, callback=output_callback, samplerate=sample_rate, device=spk_device
             ):

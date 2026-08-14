@@ -50,6 +50,8 @@ shutdown_event = threading.Event()
 interrupt_event = threading.Event()
 pause_event = threading.Event()
 now_event = threading.Event()
+# /voice on/off: VAD + voice transcription listening (off by default)
+voice_event = threading.Event()
 
 timing_info: dict[str, float | None] = {
     "vad_start": None,
@@ -351,7 +353,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                 time.sleep(settings.PLAYBACK_DELAY)
                 continue
 
-            if audio_queue.audio_queue.empty():
+            if audio_queue.audio_queue.empty() and voice_event.is_set():
                 speech_detected, audio_data = check_for_speech()
                 if speech_detected:
                     was_interrupted = True
@@ -372,7 +374,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                 if settings.LOG_TTS_CHUNKS:
                     emit("log", f"[TTS Playing] {sentence!r}")
                 was_interrupted, interrupt_data = play_audio_with_interrupt(
-                    audio_data, stop_events=[interrupt_event, pause_event]
+                    audio_data, stop_events=[interrupt_event, pause_event], monitor_input=voice_event.is_set()
                 )
                 if was_interrupted:
                     interrupt_audio = interrupt_data
@@ -465,7 +467,7 @@ def pipeline_main():
             emit("log", f"Warmup failed: {str(e)}")
 
         emit("status", "LISTENING")
-        emit("log", "=== Ready. Speaking to me (or type below) triggers a response. ===")
+        emit("log", "=== Ready. Voice input is OFF (type /voice on to enable). Typing below triggers a response. ===")
         last_activity_time = time.time()
         was_paused = False
 
@@ -494,7 +496,11 @@ def pipeline_main():
                 last_activity_time = time.time()
                 continue
 
-            audio_data = record_continuous_audio(max_wait=1.0)
+            if not voice_event.is_set():
+                audio_data = None
+                time.sleep(0.1)
+            else:
+                audio_data = record_continuous_audio(max_wait=1.0)
             if audio_data is not None:
                 speech_segments = detect_speech_segments(vad_pipeline, audio_data)
 
@@ -630,6 +636,7 @@ SLASH_COMMANDS = [
     ("/play", "Resume from pause"),
     ("/slap", "Erase queued Twitch messages, or /slap @user for just theirs"),
     ("/config", "Pick the microphone and speaker devices"),
+    ("/voice", "Show voice-input status; /voice on|off enables/disables VAD + transcription"),
     ("/help", "Show this list of slash commands"),
 ]
 
@@ -1080,6 +1087,7 @@ class SpeechTUI(App):
                 "/play": self._cmd_play,
                 "/slap": self._cmd_slap,
                 "/config": self._cmd_config,
+                "/voice": self._cmd_voice,
                 "/help": self._cmd_help,
             }.get(name)
             if handler:
@@ -1134,6 +1142,18 @@ class SpeechTUI(App):
 
     def _cmd_config(self, arg=""):
         self.push_screen(ConfigScreen())
+
+    def _cmd_voice(self, arg=""):
+        arg = arg.strip().lower()
+        if arg == "on":
+            voice_event.set()
+            self._bot_reply("Voice input enabled: VAD and voice transcription are ON.")
+        elif arg == "off":
+            voice_event.clear()
+            self._bot_reply("Voice input disabled: VAD and voice transcription are OFF.")
+        else:
+            state = "ON" if voice_event.is_set() else "OFF"
+            self._bot_reply(f"VAD and voice transcription are currently {state}.")
 
     def _cmd_help(self, arg=""):
         self.push_screen(HelpScreen())

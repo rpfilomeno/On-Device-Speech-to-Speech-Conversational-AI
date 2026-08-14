@@ -12,6 +12,7 @@ This is a real-time conversational system for two-way speech communication with 
    - Run `cd On-Device-Speech-to-Speech-Conversational-AI` and go to the project directory
    - Copy `.env.template` to `.env`
    - Add your HuggingFace token to `.env` (`HUGGINGFACE_TOKEN`)
+   - Microphone/speaker devices are stored in `settings.json` (auto-created in the project root) and picked via the in-app `/config` command — leave empty to use system defaults
    - Configure model repository IDs and target local directories in `.env`:
      - `WHISPER_MODEL_ID` / `WHISPER_MODEL_DIR`
      - `VAD_MODEL_ID` / `VAD_MODEL_DIR`
