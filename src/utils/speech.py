@@ -380,19 +380,22 @@ def check_for_speech(timeout=0.1):
     return False, None
 
 
-def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None, monitor_input=True):
+def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None, monitor_input=True, speed=1.0):
     """Plays audio while monitoring for speech interruption.
 
     Args:
         audio_data (np.ndarray): Audio data to play.
-        sample_rate (int, optional): Sample rate for playback. Defaults to 24000.
+        sample_rate (int, optional): Native sample rate of the audio. Defaults to 24000.
         stop_events (list, optional): threading.Events that abort playback (like interruption).
         monitor_input (bool, optional): Open the mic to detect barge-in. Defaults to True.
+        speed (float, optional): Output-rate multiplier. speed<1 plays slower (lower
+            pitch) without resampling, used to let TTS catch up when behind.
 
     Returns:
         tuple: A tuple containing a boolean indicating if playback was interrupted and None, or (False, None) if playback completes without interruption.
     """
     stop_events = stop_events or []
+    play_rate = max(8000, int(sample_rate * speed))
     interrupt_queue = Queue()
     position = [0]
     mic_device = _sd_device_index(settings.MIC_DEVICE, want_input=True)
@@ -441,7 +444,7 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None, m
         )
         with input_stream:
             with sd.OutputStream(
-                channels=1, callback=output_callback, samplerate=sample_rate, device=spk_device,
+                channels=1, callback=output_callback, samplerate=play_rate, device=spk_device,
                 blocksize=1024,
             ):
                 while position[0] < len(audio_data):

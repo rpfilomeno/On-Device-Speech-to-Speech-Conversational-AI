@@ -390,6 +390,73 @@ def process_input(
         return False, None
 
 
+# Adaptive playback: when TTS synthesis falls behind the player, we slow the
+# output rate slightly (gives TTS time to finish the next chunk) and poll
+# faster so the chunk is grabbed the instant it's ready. The rate stays within
+# natural speech-tempo variation -- sub-300ms gaps are imperceptible and never
+# trigger a change, and the floor is 0.92x (an 8% slowdown is heard as a
+# casual tempo shift, not robot-slow speech).
+_PLAY_SPEED_MIN = 0.92
+_PLAY_SPEED_RAMP_START = 0.3
+_PLAY_SPEED_RAMP_END = 2.5
+_BEHIND_EMA_ALPHA = 0.3
+_BEHIND_DECAY = 0.8
+_POLL_LAZY_DELAY = 0.05
+_POLL_BEHIND_THRESHOLD = 0.5
+
+# Persistent across turns (until app exit): a turn that starts slow already
+# carries the previous adaptation instead of re-learning the first gap.
+_behind_ema = 0.0
+_was_slowed = False
+# Speed is eased back to 1.0 over _EASE_ROUNDS chunks once TTS has caught up,
+# so the last stretch of recovery never snaps audibly.
+_EASE_ROUNDS = 5
+_smoothed_speed = 1.0
+_ease_rounds_left = 0
+_ease_start_speed = 1.0
+
+
+def _adaptive_speed(behind_ema: float) -> float:
+    """Output-rate multiplier in [0.92, 1.0] based on the average gap behind."""
+    if behind_ema <= _PLAY_SPEED_RAMP_START:
+        return 1.0
+    if behind_ema >= _PLAY_SPEED_RAMP_END:
+        return _PLAY_SPEED_MIN
+    t = (behind_ema - _PLAY_SPEED_RAMP_START) / (_PLAY_SPEED_RAMP_END - _PLAY_SPEED_RAMP_START)
+    return 1.0 - t * (1.0 - _PLAY_SPEED_MIN)
+
+
+def _adaptive_poll_delay(behind_ema: float) -> float:
+    """Poll interval: minimal when behind (grab audio ASAP), lazy when ahead."""
+    if behind_ema > _POLL_BEHIND_THRESHOLD:
+        return settings.PLAYBACK_DELAY
+    return _POLL_LAZY_DELAY
+
+
+def _recovery_speed(target: float) -> float:
+    """Playback speed to use, easing back to 1.0 over _EASE_ROUNDS chunks.
+
+    While synthesis is still behind (target < 1.0) we follow the target
+    directly. Once it has caught up, the speed eases from its last slowed value
+    to 1.0 with a cubic ease-out (big lift first, gentle settling), so the
+    return to normal never snaps."""
+    global _smoothed_speed, _ease_rounds_left, _ease_start_speed
+    if target < 1.0:
+        _smoothed_speed = target
+        _ease_rounds_left = 0
+        return target
+    if _smoothed_speed >= 1.0:
+        return 1.0
+    if _ease_rounds_left == 0:
+        _ease_start_speed = _smoothed_speed
+        _ease_rounds_left = _EASE_ROUNDS
+    _ease_rounds_left = max(0, _ease_rounds_left - 1)
+    progress = 1.0 - _ease_rounds_left / _EASE_ROUNDS
+    eased = 1.0 - (1.0 - progress) ** 3
+    _smoothed_speed = _ease_start_speed + (1.0 - _ease_start_speed) * eased
+    return _smoothed_speed
+
+
 def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     """Manages audio playback in a separate thread, handling interruptions.
 
@@ -399,9 +466,12 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     Returns:
         tuple[bool, None]: A tuple containing a boolean indicating if the playback was interrupted and the interrupt audio data.
     """
-    global timing_info
+    global timing_info, _behind_ema, _was_slowed
     was_interrupted = False
     interrupt_audio = None
+
+    played_any = False
+    wait_start = None
 
     try:
         while True:
@@ -426,6 +496,20 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
 
             audio_data, sentence, is_first = audio_queue.get_next_audio()
             if audio_data is not None:
+                if wait_start is not None:
+                    gap = time.time() - wait_start
+                    _behind_ema += _BEHIND_EMA_ALPHA * (gap - _behind_ema)
+                    wait_start = None
+                else:
+                    _behind_ema *= _BEHIND_DECAY
+                play_speed = _recovery_speed(_adaptive_speed(_behind_ema))
+                slowed = play_speed < 0.999
+                if slowed and not _was_slowed:
+                    emit("log", f"[TTS] Synthesis behind by ~{_behind_ema:.2f}s — slowing playback to {play_speed:.2f}x.")
+                elif not slowed and _was_slowed:
+                    emit("log", "[TTS] Synthesis caught up — playback back to normal speed.")
+                _was_slowed = slowed
+                played_any = True
                 if not timing_info["first_audio_play"]:
                     timing_info["first_audio_play"] = time.perf_counter()
                     emit("status", "SPEAKING")
@@ -436,7 +520,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                 if settings.LOG_TTS_CHUNKS:
                     emit("log", f"[TTS Playing] {sentence!r}")
                 was_interrupted, interrupt_data = play_audio_with_interrupt(
-                    audio_data, stop_events=[interrupt_event, pause_event], monitor_input=voice_event.is_set()
+                    audio_data, stop_events=[interrupt_event, pause_event], monitor_input=voice_event.is_set(), speed=play_speed
                 )
                 if was_interrupted:
                     interrupt_audio = interrupt_data
@@ -450,7 +534,9 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                     audio_queue.clear_queues()
                     break
             else:
-                time.sleep(settings.PLAYBACK_DELAY)
+                if played_any and wait_start is None:
+                    wait_start = time.time()
+                time.sleep(_adaptive_poll_delay(_behind_ema))
 
             if (
                 not audio_queue.is_running
@@ -490,10 +576,26 @@ def init_memory(mode: str) -> tuple[MemoryWorker | None, str]:
 
 _last_idle_prompt = ""
 
+# Idle-mode and typing-pause coordination, shared between the pipeline thread
+# and the TUI. pipeline_last_activity is the authoritative idle countdown clock.
+pipeline_last_activity: float = time.time()
+last_typing_activity: float = 0.0
+typing_pause_start: float | None = None
+idle_mode: bool = False
+_TYPING_PAUSE_SECONDS = 5.0
+
+
+def _idle_elapsed() -> float:
+    """Seconds since the last real activity, excluding any active typing pause."""
+    now = time.time()
+    if typing_pause_start is not None and now - last_typing_activity < _TYPING_PAUSE_SECONDS:
+        return max(0.0, typing_pause_start - pipeline_last_activity)
+    return now - pipeline_last_activity
+
 
 def pipeline_main():
     """Runs the voice-loop pipeline in a background thread; reports to the TUI."""
-    global _last_idle_prompt
+    global _last_idle_prompt, pipeline_last_activity, typing_pause_start, idle_mode
     try:
         emit("status", "INITIALIZING")
         whisper_processor = whisper_model = None
@@ -540,7 +642,7 @@ def pipeline_main():
 
         emit("status", "LISTENING")
         emit("log", "=== Ready. Voice input is OFF (type /voice on to enable). Typing below triggers a response. ===")
-        last_activity_time = time.time()
+        pipeline_last_activity = time.time()
         was_paused = False
 
         while not shutdown_event.is_set():
@@ -553,7 +655,9 @@ def pipeline_main():
                 continue
             if was_paused:
                 was_paused = False
-                last_activity_time = time.time()
+                pipeline_last_activity = time.time()
+                idle_mode = False
+                typing_pause_start = None
                 emit("status", "LISTENING")
                 emit("log", "[Command] Resumed.")
 
@@ -563,9 +667,11 @@ def pipeline_main():
                 text = None
 
             if text is not None:
-                last_activity_time = time.time()
+                idle_mode = False
+                typing_pause_start = None
+                pipeline_last_activity = time.time()
                 process_input(session, text, messages, generator, speed, memory=memory)
-                last_activity_time = time.time()
+                pipeline_last_activity = time.time()
                 continue
 
             try:
@@ -607,7 +713,9 @@ def pipeline_main():
                 speech_segments = detect_speech_segments(vad_pipeline, audio_data)
 
                 if speech_segments is not None:
-                    last_activity_time = time.time()
+                    pipeline_last_activity = time.time()
+                    typing_pause_start = None
+                    idle_mode = False
                     emit("activity")
                     emit("status", "TRANSCRIBING")
                     timing_info["transcription_start"] = time.perf_counter()
@@ -624,7 +732,7 @@ def pipeline_main():
                         was_interrupted, speech_data = process_input(
                             session, user_input, messages, generator, speed, memory=memory
                         )
-                        last_activity_time = time.time()
+                        pipeline_last_activity = time.time()
                         emit("activity")
 
                         if was_interrupted and speech_data is not None:
@@ -649,7 +757,7 @@ def pipeline_main():
                                         speed,
                                         memory=memory,
                                     )
-                                    last_activity_time = time.time()
+                                    pipeline_last_activity = time.time()
                                     emit("activity")
                     else:
                         emit("log", "No clear speech detected, please try again.")
@@ -660,11 +768,35 @@ def pipeline_main():
                 if interrupt_event.is_set():
                     interrupt_event.clear()
                     emit("log", "[Command] Stop: nothing in progress.")
-                idle_elapsed = time.time() - last_activity_time
-                if idle_elapsed >= settings.MAX_IDLE_TIME or now_event.is_set():
-                    now_event.clear()
-                    emit("status", "IDLE")
-                    emit("log", f"[Idle Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
+
+                now = time.time()
+                # Close a finished typing pause (fold the paused span out of the countdown)
+                if typing_pause_start is not None and now - last_typing_activity >= _TYPING_PAUSE_SECONDS:
+                    pipeline_last_activity += now - typing_pause_start
+                    typing_pause_start = None
+                # Typing activity: exit idle mode and suspend the countdown for 5s
+                typing_active = now - last_typing_activity < _TYPING_PAUSE_SECONDS
+                if typing_active:
+                    if idle_mode:
+                        idle_mode = False
+                        emit("status", "LISTENING")
+                        emit("log", "[Idle] Typing detected — exiting idle mode.")
+                    if typing_pause_start is None:
+                        typing_pause_start = now
+
+                idle_elapsed = _idle_elapsed()
+                if (
+                    idle_mode
+                    or (not typing_active and idle_elapsed >= settings.MAX_IDLE_TIME)
+                    or now_event.is_set()
+                ):
+                    if not idle_mode:
+                        idle_mode = True
+                        now_event.clear()
+                        emit("status", "IDLE")
+                        emit("log", f"[Idle Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
+                    else:
+                        now_event.clear()
 
                     # Check if recent Twitch events/messages are available
                     twitch_events = twitch_collector.get_recent_events(
@@ -687,9 +819,32 @@ def pipeline_main():
                         emit("log", f"[Random Idle Event] Picked prompt: '{prompt_text}'")
                         emit("transcript", "idle", prompt_text)
 
-                    process_input(session, prompt_text, messages, generator, speed, memory=memory)
-                    last_activity_time = time.time()
-                    emit("activity")
+                    _, speech_data = process_input(session, prompt_text, messages, generator, speed, memory=memory)
+                    if speech_data is not None:
+                        idle_mode = False
+                        emit("status", "LISTENING")
+                        emit("log", "[Idle] Voice interrupt — exiting idle mode.")
+                        speech_segments = detect_speech_segments(vad_pipeline, speech_data)
+                        if speech_segments is not None:
+                            emit("log", "Transcribing interrupted speech...")
+                            emit("status", "TRANSCRIBING")
+                            user_input = transcribe_audio(
+                                whisper_processor, whisper_model, speech_segments
+                            )
+                            if user_input.strip():
+                                emit("transcript", "voice", user_input)
+                                process_input(
+                                    session, user_input, messages, generator, speed, memory=memory
+                                )
+                                pipeline_last_activity = time.time()
+                                typing_pause_start = None
+                                emit("activity")
+                    else:
+                        pipeline_last_activity = time.time()
+                        typing_pause_start = None
+                        emit("activity")
+                    if idle_mode:
+                        emit("status", "IDLE")
 
                 if session is not None:
                     session.headers.update({"Connection": "keep-alive"})
@@ -782,6 +937,10 @@ class ChatInput(Input):
             emit("error", f"unfocus error: {type(e).__name__}: {e}")
 
     def on_input_changed(self, event: Input.Changed):
+        global last_typing_activity
+        last_typing_activity = time.time()
+        if idle_mode:
+            interrupt_event.set()
         value = event.value
         if value.startswith("/") and " " not in value:
             prefix = value[1:].lower()
@@ -1113,7 +1272,6 @@ class SpeechTUI(App):
     def __init__(self):
         super().__init__()
         self.status = "STARTING"
-        self.last_activity = time.time()
         self.twitch_cache = None
         self._twitch_count = 0
         self._live_static = None
@@ -1363,9 +1521,6 @@ class SpeechTUI(App):
         self.status = status
         self._update_status()
 
-    def _touch(self):
-        self.last_activity = time.time()
-
     def _timing_summary(self) -> str:
         t = timing_info
         if t["vad_start"] is None:
@@ -1385,7 +1540,7 @@ class SpeechTUI(App):
         try:
             left = f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]"
             if self.status == "LISTENING":
-                remaining = max(0.0, settings.MAX_IDLE_TIME - (time.time() - self.last_activity))
+                remaining = max(0.0, settings.MAX_IDLE_TIME - _idle_elapsed())
                 mid = f"idle [bold]{remaining:5.1f}s[/]"
             else:
                 mid = f"in turn: {self.status}"
@@ -1403,14 +1558,14 @@ class SpeechTUI(App):
         try:
             self.status_text.update(f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]")
             if self.status == "LISTENING":
-                remaining = max(0.0, settings.MAX_IDLE_TIME - (time.time() - self.last_activity))
+                remaining = max(0.0, settings.MAX_IDLE_TIME - _idle_elapsed())
                 self.idle_count.update(f"idle in [bold]{remaining:5.1f}s[/]")
                 self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
             else:
                 self.idle_count.update(f"in turn: {self.status}")
                 self.idle_bar.update(progress=settings.MAX_IDLE_TIME, total=settings.MAX_IDLE_TIME)
             self.last_activity_label.update(
-                f"Last activity: {time.strftime('%H:%M:%S', time.localtime(self.last_activity))}"
+                f"Last activity: {time.strftime('%H:%M:%S', time.localtime(pipeline_last_activity))}"
             )
         except Exception as e:
             log_error(e)
@@ -1445,7 +1600,6 @@ class SpeechTUI(App):
         try:
             if kind == "status":
                 self._set_status(payload[0])
-                self._touch()
             elif kind == "log":
                 self._log_notice(payload[0])
             elif kind == "transcript":
@@ -1455,7 +1609,6 @@ class SpeechTUI(App):
                 t.append(text)
                 self._chat_line(t)
                 _append_chat_file("in.txt", text)
-                self._touch()
             elif kind == "bot_token":
                 self._stream_buf += payload[0]
                 self._render_live()
@@ -1466,15 +1619,11 @@ class SpeechTUI(App):
                 _, bot_text = payload
                 self._finalize_live(bot_text)
                 self._reset_live()
-                self._touch()
             elif kind == "turn_start":
                 self._clear_notices()
                 self._notice_seen = set()
                 self._finalize_live("")
                 self._reset_live()
-                self._touch()
-            elif kind == "activity":
-                self._touch()
             elif kind == "error":
                 self._notice(payload[0], color="bold red")
         except Exception as e:
