@@ -416,10 +416,12 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None, m
             return
 
         if not interrupt_queue.empty() or any(e.is_set() for e in stop_events):
+            outdata.fill(0)
             raise sd.CallbackStop()
 
         remaining = len(audio_data) - position[0]
         if remaining == 0:
+            outdata.fill(0)
             raise sd.CallbackStop()
         valid_frames = min(remaining, frames)
         outdata[:valid_frames, 0] = audio_data[
@@ -439,7 +441,8 @@ def play_audio_with_interrupt(audio_data, sample_rate=24000, stop_events=None, m
         )
         with input_stream:
             with sd.OutputStream(
-                channels=1, callback=output_callback, samplerate=sample_rate, device=spk_device
+                channels=1, callback=output_callback, samplerate=sample_rate, device=spk_device,
+                blocksize=1024,
             ):
                 while position[0] < len(audio_data):
                     sd.sleep(50)
