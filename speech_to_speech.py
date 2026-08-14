@@ -898,6 +898,7 @@ SLASH_COMMANDS = [
     ("/clear", "Clear the chat display"),
     ("/stop", "Interrupt the current playback / response"),
     ("/now", "Trigger the idle event immediately"),
+    ("/idle", "Enter idle mode now (same as /now)"),
     ("/pause", "Suspend voice output and the idle countdown"),
     ("/play", "Resume from pause"),
     ("/slap", "Erase queued Twitch messages, or /slap @user for just theirs"),
@@ -1356,6 +1357,7 @@ class SpeechTUI(App):
                 "/clear": self._cmd_clear,
                 "/stop": self._cmd_stop,
                 "/now": self._cmd_now,
+                "/idle": self._cmd_idle,
                 "/pause": self._cmd_pause,
                 "/play": self._cmd_play,
                 "/slap": self._cmd_slap,
@@ -1390,6 +1392,10 @@ class SpeechTUI(App):
     def _cmd_now(self, arg=""):
         now_event.set()
         self._bot_reply("Idle countdown set to zero — I'll start talking now.")
+
+    def _cmd_idle(self, arg=""):
+        now_event.set()
+        self._bot_reply("Entering idle mode — I'll start talking now.")
 
     def _cmd_pause(self, arg=""):
         pause_event.set()
