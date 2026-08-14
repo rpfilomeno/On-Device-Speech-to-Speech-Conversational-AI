@@ -143,13 +143,19 @@ def parse_stream_chunk(chunk: bytes) -> dict | None:
         if text.startswith("{"):
             data = json.loads(text)
             content = ""
-            if "message" in data:
-                content = data["message"].get("content", "")
-            elif "choices" in data and data["choices"]:
+            msg = data.get("message") if isinstance(data, dict) else None
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+            elif (
+                isinstance(data, dict)
+                and isinstance(data.get("choices"), list)
+                and data["choices"]
+            ):
                 choice = data["choices"][0]
-                content = choice.get("delta", {}).get("content", "") or choice.get(
-                    "message", {}
-                ).get("content", "")
+                if isinstance(choice, dict):
+                    content = choice.get("delta", {}).get("content", "") or choice.get(
+                        "message", {}
+                    ).get("content", "")
 
             if content:
                 return {"choices": [{"delta": {"content": filter_response(content)}}]}
