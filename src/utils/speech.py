@@ -20,6 +20,28 @@ SPEECH_CHECK_THRESHOLD = settings.SPEECH_CHECK_THRESHOLD
 MAX_SILENCE_DURATION = settings.MAX_SILENCE_DURATION
 
 
+def inference_device() -> str:
+    """Pick the best inference device: GPU when available, else CPU."""
+    try:
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _move_to_device(obj, device=None):
+    """Move a torch module/tensor to the GPU, falling back to CPU on failure."""
+    if device is None:
+        device = inference_device()
+    if device == "cpu":
+        return obj
+    try:
+        return obj.to(device)
+    except Exception:
+        return obj.to("cpu")
+
+
 def _pyaudio_input_index(p, name: str):
     """Resolve a device name to its PyAudio input-device index (None = default)."""
     if not name:
@@ -151,6 +173,7 @@ def init_whisper_model(
     whisper_model = WhisperForConditionalGeneration.from_pretrained(
         str(local_path), local_files_only=True
     )
+    whisper_model = _move_to_device(whisper_model)
 
     return whisper_processor, whisper_model
 
@@ -177,6 +200,7 @@ def init_vad_pipeline(hf_token):
         str(vad_dir), token=hf_token, local_files_only=True
     )
     assert model is not None
+    model = _move_to_device(model)
 
     pipeline = VoiceActivityDetection(segmentation=model)
 
@@ -208,6 +232,7 @@ def detect_speech_segments(pipeline, audio_data, sample_rate=None):
 
     if not isinstance(audio_data, torch.Tensor):
         audio_data = torch.from_numpy(audio_data)
+    audio_data = _move_to_device(audio_data)
 
     if audio_data.shape[1] < sample_rate:
         padding_size = sample_rate - audio_data.shape[1]
@@ -380,6 +405,28 @@ def check_for_speech(timeout=0.1):
     return False, None
 
 
+BARGE_COMMANDS = {"stop", "wait"}
+
+
+def classify_barge(text: str) -> str:
+    """Classify captured speech for the barge gate.
+
+    Returns:
+        "command" — contains a stop/wait command (halt playback only).
+        "turn"    — more than 3 words, no command (halt and reuse as next input).
+        ""        — not a barge (resume playback).
+    """
+    words = [w.lower().strip(".,!?;:'\"()[]-") for w in text.split()]
+    words = [w for w in words if w]
+    if not words:
+        return ""
+    if any(w in BARGE_COMMANDS for w in words):
+        return "command"
+    if len(words) > 3:
+        return "turn"
+    return ""
+
+
 class TurnAudioPlayer:
     """Output (and optional barge-in input) streams kept open for an entire turn.
 
@@ -411,6 +458,8 @@ class TurnAudioPlayer:
         self._roll = []
         self._last_hot = None
         self._noise_floor = 0.0
+        self._paused = False
+        self._last_speech_time = 0.0
         self._drain_event = threading.Event()
         self._stopped = False
 
@@ -462,6 +511,7 @@ class TurnAudioPlayer:
         if level > trigger:
             # Debounce: require SPEECH_CHECK_TIMEOUT of sustained level, so
             # short transients (clicks, claps) never barge in.
+            self._last_speech_time = time.perf_counter()
             if self._last_hot is None:
                 self._last_hot = time.perf_counter()
             if (
@@ -476,9 +526,14 @@ class TurnAudioPlayer:
             cap.append(chunk.copy())
 
     def _output_callback(self, outdata, frames, time_info, status):
-        if self._stopped or self._interrupt.is_set() or any(e.is_set() for e in self._stop_events):
+        if self._stopped or any(e.is_set() for e in self._stop_events):
             outdata.fill(0)
             raise sd.CallbackStop
+        if self._paused or self._interrupt.is_set():
+            # Barge candidate: hold playback silently while the main loop
+            # transcribes the capture and decides whether to halt.
+            outdata.fill(0)
+            return
         out = []
         need = frames
         while need > 0:
@@ -531,6 +586,31 @@ class TurnAudioPlayer:
             return np.concatenate(cap)
         return None
 
+    def pause(self):
+        """Hold playback (silence) without stopping the stream or losing buffers."""
+        self._paused = True
+
+    def resume(self):
+        """Continue playback after a rejected barge candidate."""
+        self._paused = False
+        self._interrupt.clear()
+        self._capture = None
+
+    def wait_for_quiet(self, min_quiet=None, max_wait=4.0):
+        """Block until the mic has been quiet for min_quiet seconds.
+
+        Used by the barge gate so the full interrupted phrase is captured
+        instead of a truncated prefix. Capture keeps growing meanwhile.
+        """
+        if min_quiet is None:
+            min_quiet = settings.BARGE_QUIET_TIME
+        t0 = time.time()
+        while time.time() - t0 < max_wait:
+            if time.perf_counter() - self._last_speech_time >= min_quiet:
+                return True
+            time.sleep(0.05)
+        return False
+
     def flush(self):
         """Wait until everything pushed so far has been played."""
         if self._stopped or self.is_interrupted():
@@ -571,11 +651,12 @@ def transcribe_audio(processor, model, audio_data, sampling_rate=None):
         return ""
 
     if isinstance(audio_data, torch.Tensor):
-        audio_data = audio_data.numpy()
+        audio_data = audio_data.cpu().numpy()
 
     input_features = processor(
         audio_data, sampling_rate=sampling_rate, return_tensors="pt"
     ).input_features
+    input_features = input_features.to(model.device)
     predicted_ids = model.generate(input_features)
     transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
     return transcription[0]

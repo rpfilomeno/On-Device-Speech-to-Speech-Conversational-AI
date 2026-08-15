@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import src.utils.speech as speech
 from src.utils.speech import TurnAudioPlayer
 
+speech.settings.SPEECH_CHECK_TIMEOUT = 0.1
+
 
 def make_player():
     p = object.__new__(TurnAudioPlayer)
@@ -23,6 +25,7 @@ def make_player():
     p._interrupt = threading.Event()
     p._last_hot = None
     p._noise_floor = 0.0
+    p._last_speech_time = 0.0
     p._stop_events = []
     return p
 

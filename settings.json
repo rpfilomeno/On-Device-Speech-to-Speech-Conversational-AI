@@ -1,6 +1,6 @@
 {
   "MIC_DEVICE": "Microphone (USB Condenser Micro",
   "SPEAKER_DEVICE": "Line (Voicemod Virtual Audio De",
-  "TARGET_SIZE": 7,
+  "TARGET_SIZE": 6,
   "PLAYBACK_DELAY": 0.02
 }

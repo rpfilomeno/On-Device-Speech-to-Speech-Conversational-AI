@@ -25,7 +25,7 @@ from src.utils import (
     twitch_collector,
     twitch_bot_manager,
 )
-from src.utils.speech import TurnAudioPlayer
+from src.utils.speech import TurnAudioPlayer, classify_barge
 from src.utils.audio_queue import AudioGenerationQueue
 from src.utils.llm import parse_stream_chunk
 from src.utils.memory import Memory, MemoryWorker, RamMemory
@@ -192,6 +192,7 @@ def _restore_error_routing():
 
 
 _TRIM_GRACE_RETRIES = 2  # transient failures don't shrink context; trim only after this many consecutive retries
+_MAX_LLM_RETRIES = 5  # after this many blank responses, start a new session
 
 
 def _trim_history(messages: list) -> bool:
@@ -229,6 +230,9 @@ def process_input(
     generator: VoiceGenerator,
     speed: float,
     memory: MemoryWorker | None = None,
+    whisper_processor=None,
+    whisper_model=None,
+    vad_pipeline=None,
 ) -> tuple[bool, np.ndarray | None]:
     """Processes user input, generates a response, and handles audio output.
 
@@ -239,6 +243,9 @@ def process_input(
         generator (VoiceGenerator): The voice generator object.
         speed (float): The playback speed.
         memory (Memory, optional): Long-term vector memory to recall from / write to.
+        whisper_processor: Whisper processor used to gate barge candidates.
+        whisper_model: Whisper model used to gate barge candidates.
+        vad_pipeline: VAD used to strip non-speech from barge candidates.
 
     Returns:
         tuple[bool, None]: A tuple containing a boolean indicating if the process was interrupted and None.
@@ -286,7 +293,9 @@ def process_input(
 
         def worker_runner():
             nonlocal interrupted, interrupt_data
-            was_int, int_data = audio_playback_worker(audio_queue)
+            was_int, int_data = audio_playback_worker(
+                audio_queue, whisper_processor, whisper_model, vad_pipeline
+            )
             interrupted = was_int
             interrupt_data = int_data
 
@@ -295,6 +304,7 @@ def process_input(
         playback_thread.start()
 
         retry = 0
+        session_reset = False
         bot_text = ""
         while True:
             response_stream = get_ai_response(
@@ -356,7 +366,19 @@ def process_input(
             if bot_text:
                 break
 
+            if retry >= _MAX_LLM_RETRIES and not session_reset:
+                messages[:] = [
+                    {"role": "system", "content": settings.DEFAULT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_input},
+                ]
+                session_reset = True
+                retry = 0
+                emit("log", "[Chat] LLM blank after history trim — starting a new session.")
+                llm_messages = llm_messages_for(messages)
+                continue
+
             if not _retry_llm(messages, retry, "LLM returned empty (context too long?)"):
+                emit("log", "Failed to get a response after trimming history.")
                 break
             retry += 1
             llm_messages = llm_messages_for(messages)
@@ -522,7 +544,9 @@ def _record_delay_jitter(jitter_ms: float) -> float | None:
     return None
 
 
-def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
+def audio_playback_worker(
+    audio_queue, whisper_processor=None, whisper_model=None, vad_pipeline=None
+) -> tuple[bool, np.ndarray | None]:
     """Manages audio playback in a separate thread, handling interruptions.
 
     One TurnAudioPlayer stays open for the whole turn: gapless chunk playback,
@@ -530,6 +554,9 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
 
     Args:
         audio_queue (AudioGenerationQueue): The audio queue object.
+        whisper_processor: Whisper processor used to gate barge candidates.
+        whisper_model: Whisper model used to gate barge candidates.
+        vad_pipeline: VAD used to strip non-speech from barge candidates.
 
     Returns:
         tuple[bool, None]: A tuple containing a boolean indicating if the playback was interrupted and the interrupt audio data.
@@ -566,18 +593,52 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                 time.sleep(settings.PLAYBACK_DELAY)
                 continue
             if player.is_interrupted():
-                was_interrupted = True
                 if pause_event.is_set():
                     emit("log", "[Command] Pause: playback suspended.")
-                elif interrupt_event.is_set():
+                    player.stop()
+                    audio_queue.clear_queues()
+                    break
+                if interrupt_event.is_set():
                     interrupt_event.clear()
                     emit("log", "[Command] Stop: playback interrupted, clearing queues.")
-                else:
-                    interrupt_audio = player.take_capture()
-                    emit("log", "[TTS Interrupted] Speech detected from microphone! Clearing audio queues...")
-                player.stop()
-                audio_queue.clear_queues()
-                break
+                    player.stop()
+                    audio_queue.clear_queues()
+                    break
+                # Barge candidate: hold playback, capture the full phrase, then decide.
+                player.pause()
+                emit("log", "[TTS] Voice detected — checking for barge intent...")
+                player.wait_for_quiet()
+                capture = player.take_capture()
+                if capture is not None and whisper_processor is not None:
+                    text = ""
+                    try:
+                        if vad_pipeline is not None:
+                            seg = detect_speech_segments(vad_pipeline, capture)
+                            if seg is not None:
+                                text = transcribe_audio(
+                                    whisper_processor, whisper_model, seg
+                                )
+                        else:
+                            text = transcribe_audio(
+                                whisper_processor, whisper_model, capture
+                            )
+                    except Exception as e:
+                        log_error(e)
+                        text = ""
+                    reason = classify_barge(text)
+                    if reason:
+                        was_interrupted = True
+                        if reason == "turn":
+                            interrupt_audio = capture
+                            emit("log", f"[TTS Interrupted] '{text}' — halting, using as next input.")
+                        else:
+                            emit("log", f"[TTS Interrupted] '{text}' — halting playback.")
+                        player.stop()
+                        audio_queue.clear_queues()
+                        break
+                    emit("log", f"[TTS] '{text}' — not a barge command, resuming.")
+                player.resume()
+                continue
 
             audio_data, sentence, is_first = audio_queue.get_next_audio()
             if audio_data is not None:
@@ -774,7 +835,9 @@ def pipeline_main():
                 idle_mode = False
                 typing_pause_start = None
                 pipeline_last_activity = time.time()
-                process_input(session, text, messages, generator, speed, memory=memory)
+                process_input(session, text, messages, generator, speed, memory=memory,
+                              whisper_processor=whisper_processor, whisper_model=whisper_model,
+                              vad_pipeline=vad_pipeline)
                 pipeline_last_activity = time.time()
                 continue
 
@@ -834,7 +897,9 @@ def pipeline_main():
                     if user_input.strip():
                         emit("transcript", "voice", user_input)
                         was_interrupted, speech_data = process_input(
-                            session, user_input, messages, generator, speed, memory=memory
+                            session, user_input, messages, generator, speed, memory=memory,
+                            whisper_processor=whisper_processor, whisper_model=whisper_model,
+                            vad_pipeline=vad_pipeline,
                         )
                         pipeline_last_activity = time.time()
                         emit("activity")
@@ -860,6 +925,9 @@ def pipeline_main():
                                         generator,
                                         speed,
                                         memory=memory,
+                                        whisper_processor=whisper_processor,
+                                        whisper_model=whisper_model,
+                                        vad_pipeline=vad_pipeline,
                                     )
                                     pipeline_last_activity = time.time()
                                     emit("activity")
@@ -923,7 +991,9 @@ def pipeline_main():
                         emit("log", f"[Random Idle Event] Picked prompt: '{prompt_text}'")
                         emit("transcript", "idle", prompt_text)
 
-                    _, speech_data = process_input(session, prompt_text, messages, generator, speed, memory=memory)
+                    _, speech_data = process_input(session, prompt_text, messages, generator, speed, memory=memory,
+                                                   whisper_processor=whisper_processor, whisper_model=whisper_model,
+                                                   vad_pipeline=vad_pipeline)
                     if speech_data is not None:
                         idle_mode = False
                         emit("status", "LISTENING")
@@ -938,7 +1008,9 @@ def pipeline_main():
                             if user_input.strip():
                                 emit("transcript", "voice", user_input)
                                 process_input(
-                                    session, user_input, messages, generator, speed, memory=memory
+                                    session, user_input, messages, generator, speed, memory=memory,
+                                    whisper_processor=whisper_processor, whisper_model=whisper_model,
+                                    vad_pipeline=vad_pipeline,
                                 )
                                 pipeline_last_activity = time.time()
                                 typing_pause_start = None
@@ -1085,6 +1157,7 @@ class ChatInput(Input):
                 return
             if text:
                 text_input_queue.put(text)
+                interrupt_event.set()
                 emit("activity")
                 emit("transcript", "text", text)
                 self.value = ""
