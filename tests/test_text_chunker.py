@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.utils.text_chunker import TextChunker
+from src.utils.text_chunker import TextChunker, GRACE_WORDS
 
 
 def words(n):
@@ -36,10 +36,10 @@ t = words(25)
 t[15] = "and"
 assert c.find_break_point(t, 20) == 16
 
-# A break just past the target does not overshoot; chunk stays at target_size
+# A break just past the target (inside the grace window) is caught
 t = words(24)
 t[21] = "done."
-assert c.find_break_point(t, 20) == 20
+assert c.find_break_point(t, 20) == 22
 
 # ---- should_process trigger ----
 from src.utils.config import settings
@@ -56,12 +56,31 @@ assert c2.should_process("hi there.")
 # Fewer than target words, no trailing punctuation -> wait
 assert not c2.should_process("a b c d")
 
-# More than target words with a natural break in the scan window -> fire
+# More than target words with a natural break in the grace window -> fire
 t = " ".join(words(8))
 t = t.replace("w4", "and")   # break at index 4, inside the 5-word window
 assert c2.should_process(t), t
 
-# More than target words but no break in the scan window -> wait (no hard cut)
-assert not c2.should_process(" ".join(words(8)))
+# Within the grace window and no break -> wait for a break or the hard cut
+assert not c2.should_process(" ".join(words(5 + GRACE_WORDS)))
+
+# Within the grace window with a break past the target -> fire
+t = " ".join(words(7))
+t = t.replace("w6", "done.")
+assert c2.should_process(t), t
+
+# Past the grace window -> hard cut fires even with no break
+assert c2.should_process(" ".join(words(8)))
+
+# find_break_point scans the grace window for a late break, else hard-cuts
+assert GRACE_WORDS == 2
+t = words(17)
+t[16] = "done."
+assert c.find_break_point(t, 15) == 17, c.find_break_point(t, 15)
+assert c.find_break_point(words(17), 15) == 15
+
+# Shorter-than-scan boundary: len(words) inside grace window, no break
+assert c.find_break_point(words(16), 15) == 15
+assert c.find_break_point(words(17), 15) == 15
 
 print("test_text_chunker: OK")

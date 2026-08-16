@@ -1,5 +1,7 @@
 from .config import settings
 
+GRACE_WORDS = 2
+
 
 class TextChunker:
     """A class to handle intelligent text chunking for voice generation."""
@@ -45,8 +47,9 @@ class TextChunker:
         """Determines if text should be processed based on length or punctuation.
 
         Fires when a completed sentence (trailing punctuation) lands, or once the
-        stream has MORE than the target word count with a natural break available
-        in the scan window, so the greedy cut starts TTS at a real break.
+        stream has MORE than the target word count. A natural break available in
+        the grace window starts TTS at a real break; past the grace window it
+        hard-cuts so long breakless text still gets spoken.
 
         Args:
             text (str): The text to check.
@@ -69,12 +72,19 @@ class TextChunker:
         if len(words) <= target:
             return False
 
-        return any(self._natural_break_priority(w) > 0 for w in words[:target])
+        if len(words) > target + GRACE_WORDS:
+            return True
+
+        return any(
+            self._natural_break_priority(w) > 0
+            for w in words[: target + GRACE_WORDS]
+        )
 
     def find_break_point(self, words: list, target_size: int) -> int:
         """Finds the greedy break point in text: the furthest natural break
-        (punctuation or semantic connector) at or before target_size, so chunks
-        fill up to TARGET_SIZE words. Falls back to a hard cut at target_size.
+        (punctuation or semantic connector) at or before target_size plus the
+        grace window, so chunks fill up to TARGET_SIZE words. Falls back to a
+        hard cut at target_size.
 
         Args:
             words (list): The list of words to find a break point in.
@@ -86,7 +96,7 @@ class TextChunker:
         if len(words) <= target_size:
             return len(words)
 
-        for i in range(target_size - 1, -1, -1):
+        for i in range(min(len(words), target_size + GRACE_WORDS) - 1, -1, -1):
             if self._natural_break_priority(words[i]) > 0:
                 return i + 1
 
