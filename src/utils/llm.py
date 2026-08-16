@@ -2,6 +2,7 @@ import re
 import requests
 import json
 import time
+import urllib.parse
 from src.utils.config import settings, log_error
 
 _last_parse_error_time: float | None = None
@@ -169,3 +170,28 @@ def parse_stream_chunk(chunk: bytes) -> dict | None:
         if str(e) != "Expecting value: line 1 column 2 (char 1)":
             print(f"Error parsing stream chunk: {str(e)}")
         return None
+
+
+def fetch_context_window(
+    session: requests.Session, llm_model: str, llm_url: str
+) -> int | None:
+    """Query the LM Studio REST API for the model's actually-loaded context length.
+
+    LM Studio serves its REST API from the host root (not under /v1), so a
+    trailing /v1 on LM_STUDIO_URL is stripped. Returns None on any failure
+    (server down, non-LM Studio backend like Ollama, model not loaded) so the
+    caller can fall back to a configured default.
+    """
+    url = llm_url.rstrip("/")
+    if url.endswith("/v1"):
+        url = url[: -len("/v1")]
+    endpoint = f"{url}/api/v0/models/{urllib.parse.quote(llm_model)}"
+    try:
+        res = session.get(endpoint, timeout=5)
+        res.raise_for_status()
+        ctx = res.json().get("loaded_context_length")
+        if ctx:
+            return int(ctx)
+    except Exception:
+        pass
+    return None

@@ -27,7 +27,7 @@ from src.utils import (
 )
 from src.utils.speech import TurnAudioPlayer, classify_barge
 from src.utils.audio_queue import AudioGenerationQueue
-from src.utils.llm import parse_stream_chunk
+from src.utils.llm import parse_stream_chunk, fetch_context_window
 from src.utils.memory import Memory, MemoryWorker, RamMemory
 from src.utils.text_chunker import TextChunker
 
@@ -193,19 +193,20 @@ def _restore_error_routing():
 
 _TRIM_GRACE_RETRIES = 2  # transient failures don't shrink context; trim only after this many consecutive retries
 _MAX_LLM_RETRIES = 5  # after this many blank responses, start a new session
+_ANCHOR_TURNS = 1  # keep the first completed turn as a topic anchor when trimming
 
 
 def _trim_history(messages: list) -> bool:
-    """Drop a random contiguous block of the completed turns (a random 20-50%
-    of the middle, at a random position), keeping the system prompt and the
-    current user message, so each retry sends a smaller context. Returns True
-    if anything was dropped."""
-    middle_len = len(messages) - 2
-    if middle_len < 2:
+    """Deterministic fallback for the retry path: drop half the droppable middle
+    turns (after the anchor), keeping the system prompt, the anchor turn, the
+    recent turns, and the current user message. Returns True if anything was
+    dropped."""
+    droppable = (len(messages) - 2) // 2 - _ANCHOR_TURNS
+    if droppable < 1:
         return False
-    n_drop = max(1, int(middle_len * random.uniform(0.2, 0.5)))
-    start = random.randint(0, middle_len - n_drop)
-    del messages[1 + start:1 + start + n_drop]
+    n_drop = max(1, droppable // 2)
+    first = 1 + 2 * _ANCHOR_TURNS
+    del messages[first:first + n_drop * 2]
     return True
 
 
@@ -221,6 +222,31 @@ def _retry_llm(messages: list, retry: int, reason: str) -> bool:
     else:
         emit("log", f"{reason} - retrying without trimming history.")
     return True
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate (~4 chars/token); no tokenizer is available offline."""
+    return max(1, len(text) // 4)
+
+
+def _trim_history_to_budget(messages: list) -> int:
+    """Keep the system prompt, the first (anchor) turn, and the most recent turns,
+    dropping the oldest middle turns until the prompt fits within
+    CONTEXT_WINDOW * CONTEXT_TRIM_RATIO tokens. The current user message
+    (messages[-1]) is always kept. Returns turns dropped (0 = nothing trimmed)."""
+    budget = int(settings.CONTEXT_WINDOW * settings.CONTEXT_TRIM_RATIO)
+    tokens = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+    dropped = 0
+    first_droppable = 1 + 2 * _ANCHOR_TURNS
+    max_droppable_pairs = (len(messages) - 2) // 2 - _ANCHOR_TURNS
+    while tokens > budget and dropped < max_droppable_pairs:
+        i = first_droppable + dropped * 2
+        tokens -= _estimate_tokens(messages[i].get("content", ""))
+        tokens -= _estimate_tokens(messages[i + 1].get("content", ""))
+        dropped += 1
+    if dropped:
+        del messages[first_droppable:first_droppable + dropped * 2]
+    return dropped
 
 
 def process_input(
@@ -281,6 +307,10 @@ def process_input(
 
     llm_messages = llm_messages_for(messages)
 
+    if _trim_history_to_budget(messages):
+        emit("log", "[Chat] Trimmed history to fit within context budget.")
+        llm_messages = llm_messages_for(messages)
+
     emit("turn_start", user_input)
     interrupt_event.clear()
     start_time = time.time()
@@ -307,12 +337,14 @@ def process_input(
         session_reset = False
         bot_text = ""
         while True:
+            prompt_tokens = sum(_estimate_tokens(m.get("content", "")) for m in llm_messages)
+            max_tokens = min(settings.MAX_TOKENS, max(1, settings.CONTEXT_WINDOW - prompt_tokens))
             response_stream = get_ai_response(
                 session=session,
                 messages=llm_messages,
                 llm_model=settings.LLM_MODEL,
                 llm_url=settings.LM_STUDIO_URL,
-                max_tokens=settings.MAX_TOKENS,
+                max_tokens=max_tokens,
                 stream=True,
             )
 
@@ -785,6 +817,14 @@ def pipeline_main():
         if settings.TWITCH_CLIENT_CHANNEL:
             emit("log", f"Starting Twitch chat collector for channel: {settings.TWITCH_CLIENT_CHANNEL}...")
             twitch_bot_manager.start(settings.TWITCH_CLIENT_CHANNEL)
+
+        detected_ctx = fetch_context_window(session, settings.LLM_MODEL, settings.LM_STUDIO_URL)
+        if detected_ctx:
+            settings.CONTEXT_WINDOW = detected_ctx
+            emit("log", f"LLM context window: {settings.CONTEXT_WINDOW} tokens "
+                        f"(prompt kept ≤ {int(settings.CONTEXT_WINDOW * settings.CONTEXT_TRIM_RATIO)}).")
+        else:
+            emit("log", f"Could not detect context window; using fallback {settings.CONTEXT_WINDOW}.")
 
         try:
             emit("log", "Warming up the LLM...")

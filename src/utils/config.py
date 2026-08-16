@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     LLM_MODEL: str = Field(...)
     NUM_THREADS: int = Field(default=2)
     MAX_TOKENS: int = Field(default=512)
+    # LLM context window (tokens). Fallback default; pipeline_main overrides it
+    # at startup from the LM Studio REST API (loaded_context_length).
+    CONTEXT_WINDOW: int = Field(default=2048)
+    # Max fraction of the context window the prompt (history) may use, so the
+    # model always has headroom left to generate a full response.
+    CONTEXT_TRIM_RATIO: float = Field(default=0.8)
     LLM_TEMPERATURE: float = Field(default=0.7)
 
     QDRANT_HOST: Optional[str] = Field(default="")
