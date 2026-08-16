@@ -75,7 +75,7 @@ I ran this test on an AMD Ryzen 5600G, 16 GB, SSD, and No-GPU setup, achieving c
 
 ## How do we reduce latency?
 
-### Priority based text chunking
+### Text chunking
 
 We capitalize on the streaming output of the language model to reduce latency. Instead of waiting for the entire response to be generated, we process and deliver each chunk of text as soon as they become available, form phrases, and send it to the TTS engine queue. We play the audio as soon as it becomes available. This way, the user gets a very fast response, while the rest of the response is being generated.
 
@@ -83,19 +83,11 @@ Our custom `TextChunker` analyzes incoming text streams from the language model 
 
 The `TextChunker` maintains a set of break points:
 
-- **Sentence breaks**: `.`, `!`, `?` (highest priority)
-- **Semantic breaks** with priority levels:
-  - Level 4: `however`, `therefore`, `furthermore`, `moreover`, `nevertheless`
-  - Level 3: `while`, `although`, `unless`, `since`
-  - Level 2: `and`, `but`, `because`, `then`
-- **Punctuation breaks**: `;` (4), `:` (4), `,` (3), `-` (2)
+- **Sentence breaks**: `.`, `!`, `?`
+- **Semantic breaks**: `however`, `therefore`, `furthermore`, `moreover`, `nevertheless`, `while`, `although`, `unless`, `since`, `and`, `but`, `because`, `then`
+- **Punctuation breaks**: `;`, `:`, `,`, `-`
 
-When processing text, the `TextChunker` uses a priority-based system:
-
-1. Looks for sentence-ending punctuation first (highest priority 5)
-2. Checks for semantic break words with their associated priority levels
-3. Falls back to punctuation marks with lower priorities
-4. Splits at target word count if no natural breaks are found
+When processing text, the `TextChunker` fills each chunk greedily: it scans from the last word of the target window (`TARGET_SIZE` words, `FIRST_SENTENCE_SIZE` for the first chunk) back toward the start and cuts at the **furthest natural break** — so each chunk synthesizes as close to `TARGET_SIZE` words as the text allows. If no natural break exists in the window, it cuts at exactly the target word count.
 
 The text chunking method significantly reduces perceived latency by processing and delivering the first chunk of text as soon as it becomes available. Let's consider a hypothetical system where the language model generates responses at a certain rate. If we imagine a scenario where the model produces a response of N words at a rate of R words per second, waiting for the complete response would introduce a delay of N/R seconds before any audio is produced. With text chunking, the system can start processing the first M words as soon as they are ready (after M/R seconds), while the remaining words continue to be generated. This means the user hears the initial part of the response in just M/R seconds, while the rest streams in naturally.
 

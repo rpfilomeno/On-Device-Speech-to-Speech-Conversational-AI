@@ -18,13 +18,12 @@ from src.utils import (
     twitch_bot_manager,
 )
 from src.utils.audio_queue import AudioGenerationQueue
-from src.utils.config import save_settings, log_error, settings
+from src.utils.config import log_error, settings
 from src.utils.llm import parse_stream_chunk, fetch_context_window
 from src.utils.memory import Memory, MemoryWorker, RamMemory
 from src.utils.speech import TurnAudioPlayer
 from src.utils.text_chunker import TextChunker
 
-from . import pacing
 from . import state
 from . import history
 
@@ -147,7 +146,6 @@ def process_input(
                         chunker.current_text.append(content)
 
                         text = "".join(chunker.current_text)
-                        settings.TARGET_SIZE = pacing.adaptive_target_words()
                         if chunker.should_process(text):
                             if not state.timing_info["audio_queued"]:
                                 state.timing_info["audio_queued"] = time.perf_counter()
@@ -160,7 +158,6 @@ def process_input(
                 if choice.get("finish_reason") == "stop":
                     break
 
-            settings.TARGET_SIZE = pacing.adaptive_target_words()
             final_flushed = chunker.flush(audio_queue)
             if final_flushed:
                 complete_response.append(final_flushed)
@@ -264,10 +261,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                 if wait_start is not None:
                     gap = time.time() - wait_start
                     gaps.append(gap)
-                    pacing._behind_ema += pacing._BEHIND_EMA_ALPHA * (gap - pacing._behind_ema)
                     wait_start = None
-                else:
-                    pacing._behind_ema *= pacing._BEHIND_DECAY
                 played_any = True
                 if not state.timing_info["first_audio_play"]:
                     state.timing_info["first_audio_play"] = time.perf_counter()
@@ -282,7 +276,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
             else:
                 if played_any and wait_start is None and not player.is_playing():
                     wait_start = time.time()
-                time.sleep(pacing.adaptive_poll_delay(pacing._behind_ema))
+                time.sleep(settings.PLAYBACK_DELAY)
 
             if (
                 not audio_queue.is_running
@@ -298,11 +292,6 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     finally:
         player.stop()
 
-    save_settings(
-        TARGET_SIZE=round(settings.TARGET_SIZE),
-        PLAYBACK_DELAY=settings.PLAYBACK_DELAY,
-    )
-
     if gaps:
         mean = sum(gaps) / len(gaps)
         stddev = (sum((g - mean) ** 2 for g in gaps) / len(gaps)) ** 0.5
@@ -311,27 +300,6 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
             f"[Playback] jitter (inter-chunk gap): stddev {stddev * 1000:.0f}ms, "
             f"mean {mean * 1000:.0f}ms, max {max(gaps) * 1000:.0f}ms over {len(gaps)} gap(s).",
         )
-        if len(gaps) >= 2:
-            used_target = round(settings.TARGET_SIZE)
-            used_delay = settings.PLAYBACK_DELAY
-            best_target = pacing.record_jitter(used_target, stddev * 1000)
-            best_delay = pacing.record_delay_jitter(stddev * 1000)
-            if best_target is not None and best_target != used_target:
-                settings.TARGET_SIZE = best_target
-                save_settings(TARGET_SIZE=best_target)
-                state.emit(
-                    "log",
-                    f"[Jitter Stats] Best TARGET_SIZE is now {best_target} "
-                    f"(lowest mean jitter); saved to settings.json.",
-                )
-            if best_delay is not None:
-                settings.PLAYBACK_DELAY = best_delay
-                save_settings(PLAYBACK_DELAY=best_delay)
-                state.emit(
-                    "log",
-                    f"[Jitter Stats] Best PLAYBACK_DELAY is now {best_delay}s "
-                    f"(lowest mean jitter); saved to settings.json.",
-                )
 
     return was_interrupted, interrupt_audio
 

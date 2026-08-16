@@ -12,7 +12,7 @@ import numpy as np
 import requests
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-from src.utils.config import settings, save_settings, save_device_settings, log_error
+from src.utils.config import settings, save_device_settings, log_error
 from src.utils import (
     VoiceGenerator,
     get_ai_response,
@@ -376,7 +376,6 @@ def process_input(
                         chunker.current_text.append(content)
 
                         text = "".join(chunker.current_text)
-                        settings.TARGET_SIZE = _adaptive_target_words()
                         if chunker.should_process(text):
                             if not timing_info["audio_queued"]:
                                 timing_info["audio_queued"] = time.perf_counter()
@@ -389,7 +388,6 @@ def process_input(
                 if choice.get("finish_reason") == "stop":
                     break
 
-            settings.TARGET_SIZE = _adaptive_target_words()
             final_flushed = chunker.flush(audio_queue)
             if final_flushed:
                 complete_response.append(final_flushed)
@@ -445,143 +443,6 @@ def process_input(
         return False, None
 
 
-# Adaptive chunking: when TTS synthesis falls behind the player, shrink the
-# words-per-chunk target so sentences synthesize faster (fewer words = shorter
-# audio = less time behind), and poll fast so the next chunk is grabbed the
-# instant it's ready. The chunk size eases the same way the old playback-speed
-# recovery did: smooth descent, cubic ease-out back to full size.
-_TARGET_MIN = 6
-_TARGET_RAMP_START = 0.3
-_TARGET_RAMP_END = 2.5
-_BEHIND_EMA_ALPHA = 0.3
-_BEHIND_DECAY = 0.8
-_POLL_LAZY_DELAY = 0.05
-_POLL_BEHIND_THRESHOLD = 0.5
-
-# Persistent across turns (until app exit): a turn that starts slow already
-# carries the previous adaptation instead of re-learning the first gap.
-_behind_ema = 0.0
-_EASE_ROUNDS = 5
-_smoothed_target: float | None = None
-_ease_rounds_left = 0
-_ease_start_value = 0.0
-
-
-def _target_for(behind_ema: float) -> float:
-    """Raw words-per-chunk target for a given behind-average."""
-    full = float(settings.TARGET_SIZE)
-    if behind_ema <= _TARGET_RAMP_START:
-        return full
-    if behind_ema >= _TARGET_RAMP_END:
-        return float(_TARGET_MIN)
-    t = (behind_ema - _TARGET_RAMP_START) / (_TARGET_RAMP_END - _TARGET_RAMP_START)
-    return full - t * (full - _TARGET_MIN)
-
-
-def _ease_to(current: float, target: float) -> float:
-    """Ease `current` toward `target`: smooth descent, 5-round cubic ease-out
-    on recovery (the scheme the playback-speed recovery used)."""
-    global _ease_rounds_left, _ease_start_value
-    if abs(target - current) < 0.05:
-        _ease_rounds_left = 0
-        return target
-    if target < current:
-        _ease_rounds_left = 0
-        return current + 0.5 * (target - current)
-    if _ease_rounds_left == 0:
-        _ease_start_value = current
-        _ease_rounds_left = _EASE_ROUNDS
-    _ease_rounds_left = max(0, _ease_rounds_left - 1)
-    progress = 1.0 - _ease_rounds_left / _EASE_ROUNDS
-    eased = 1.0 - (1.0 - progress) ** 3
-    return _ease_start_value + (target - _ease_start_value) * eased
-
-
-def _adaptive_target_words() -> int:
-    """Current eased words-per-chunk target, driven by the behind-average."""
-    global _smoothed_target
-    target = _target_for(_behind_ema)
-    if _smoothed_target is None:
-        _smoothed_target = target
-    else:
-        _smoothed_target = _ease_to(_smoothed_target, target)
-    return int(round(_smoothed_target))
-
-
-def _adaptive_poll_delay(behind_ema: float) -> float:
-    """Poll interval: minimal when behind (grab audio ASAP), lazy when ahead."""
-    if behind_ema > _POLL_BEHIND_THRESHOLD:
-        return settings.PLAYBACK_DELAY
-    return _POLL_LAZY_DELAY
-
-
-# Runtime jitter learner: bucket per-turn jitter (inter-chunk gap stddev) by the
-# words-per-chunk target in effect, then persist the best-scoring target size to
-# settings.json so future sessions start already-tuned.
-_jitter_samples: dict[int, list[float]] = {}
-_MIN_JITTER_SAMPLES = 3
-
-
-def _best_target_size() -> int | None:
-    """Largest TARGET_SIZE whose mean jitter stays within JITTER_MARGIN_MS of the
-    best (lowest) jitter. Keeps chunk size high while latency is acceptable;
-    only a size with meaningfully worse jitter is rejected. Falls back to the
-    lowest-jitter bucket when only it qualifies."""
-    eligible = [
-        (size, sum(samples) / len(samples))
-        for size, samples in _jitter_samples.items()
-        if len(samples) >= _MIN_JITTER_SAMPLES
-    ]
-    if not eligible:
-        return None
-    best_jitter = min(m for _, m in eligible)
-    ceiling = best_jitter + settings.JITTER_MARGIN_MS
-    acceptable = [size for size, m in eligible if m <= ceiling]
-    return max(acceptable) if acceptable else min(eligible)[0]
-
-
-def _record_jitter(target_size: int, jitter_ms: float) -> int | None:
-    """Feed one turn's jitter into the learner; returns the current best target size."""
-    samples = _jitter_samples.setdefault(target_size, [])
-    samples.append(jitter_ms)
-    del samples[:-30]
-    return _best_target_size()
-
-
-# PLAYBACK_DELAY tuning: round-robin one candidate per turn until every candidate
-# has enough jitter samples, then settle on the lowest-mean one and persist it.
-_DELAY_CANDIDATES = [0.005, 0.01, 0.02, 0.05]
-_delay_samples: dict[float, list[float]] = {}
-_delay_explore_index = 0
-_delay_settled = False
-
-
-def _record_delay_jitter(jitter_ms: float) -> float | None:
-    """Record jitter under the current PLAYBACK_DELAY and advance to the next
-    candidate. Once every candidate has enough samples, returns the best
-    (lowest mean jitter) delay to adopt, else None."""
-    global _delay_explore_index, _delay_settled
-    if _delay_settled:
-        return None
-    if settings.PLAYBACK_DELAY not in _DELAY_CANDIDATES:
-        settings.PLAYBACK_DELAY = _DELAY_CANDIDATES[0]
-    samples = _delay_samples.setdefault(settings.PLAYBACK_DELAY, [])
-    samples.append(jitter_ms)
-    del samples[:-30]
-    if len(_delay_samples) == len(_DELAY_CANDIDATES) and all(
-        len(v) >= _MIN_JITTER_SAMPLES for v in _delay_samples.values()
-    ):
-        _delay_settled = True
-        return min(
-            _delay_samples, key=lambda k: sum(_delay_samples[k]) / len(_delay_samples[k])
-        )
-    _delay_explore_index += 1
-    settings.PLAYBACK_DELAY = _DELAY_CANDIDATES[
-        _delay_explore_index % len(_DELAY_CANDIDATES)
-    ]
-    return None
-
-
 def audio_playback_worker(
     audio_queue, whisper_processor=None, whisper_model=None, vad_pipeline=None
 ) -> tuple[bool, np.ndarray | None]:
@@ -599,7 +460,7 @@ def audio_playback_worker(
     Returns:
         tuple[bool, None]: A tuple containing a boolean indicating if the playback was interrupted and the interrupt audio data.
     """
-    global timing_info, _behind_ema
+    global timing_info
     was_interrupted = False
     interrupt_audio = None
 
@@ -683,10 +544,7 @@ def audio_playback_worker(
                 if wait_start is not None:
                     gap = time.time() - wait_start
                     gaps.append(gap)
-                    _behind_ema += _BEHIND_EMA_ALPHA * (gap - _behind_ema)
                     wait_start = None
-                else:
-                    _behind_ema *= _BEHIND_DECAY
                 played_any = True
                 if not timing_info["first_audio_play"]:
                     timing_info["first_audio_play"] = time.perf_counter()
@@ -701,7 +559,7 @@ def audio_playback_worker(
             else:
                 if played_any and wait_start is None and not player.is_playing():
                     wait_start = time.time()
-                time.sleep(_adaptive_poll_delay(_behind_ema))
+                time.sleep(settings.PLAYBACK_DELAY)
 
             if (
                 not audio_queue.is_running
@@ -717,11 +575,6 @@ def audio_playback_worker(
     finally:
         player.stop()
 
-    save_settings(
-        TARGET_SIZE=round(settings.TARGET_SIZE),
-        PLAYBACK_DELAY=settings.PLAYBACK_DELAY,
-    )
-
     if gaps:
         mean = sum(gaps) / len(gaps)
         stddev = (sum((g - mean) ** 2 for g in gaps) / len(gaps)) ** 0.5
@@ -730,27 +583,6 @@ def audio_playback_worker(
             f"[Playback] jitter (inter-chunk gap): stddev {stddev * 1000:.0f}ms, "
             f"mean {mean * 1000:.0f}ms, max {max(gaps) * 1000:.0f}ms over {len(gaps)} gap(s).",
         )
-        if len(gaps) >= 2:
-            used_target = round(settings.TARGET_SIZE)
-            used_delay = settings.PLAYBACK_DELAY
-            best_target = _record_jitter(used_target, stddev * 1000)
-            best_delay = _record_delay_jitter(stddev * 1000)
-            if best_target is not None and best_target != used_target:
-                settings.TARGET_SIZE = best_target
-                save_settings(TARGET_SIZE=best_target)
-                emit(
-                    "log",
-                    f"[Jitter Stats] Best TARGET_SIZE is now {best_target} "
-                    f"(lowest mean jitter); saved to settings.json.",
-                )
-            if best_delay is not None:
-                settings.PLAYBACK_DELAY = best_delay
-                save_settings(PLAYBACK_DELAY=best_delay)
-                emit(
-                    "log",
-                    f"[Jitter Stats] Best PLAYBACK_DELAY is now {best_delay}s "
-                    f"(lowest mean jitter); saved to settings.json.",
-                )
 
     return was_interrupted, interrupt_audio
 

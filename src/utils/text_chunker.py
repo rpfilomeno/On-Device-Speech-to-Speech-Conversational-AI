@@ -54,7 +54,9 @@ class TextChunker:
         return len(words) >= target
 
     def find_break_point(self, words: list, target_size: int) -> int:
-        """Finds optimal break point in text.
+        """Finds the greedy break point in text: the furthest natural break
+        (punctuation or semantic connector) at or before target_size, so chunks
+        fill up to TARGET_SIZE words. Falls back to a hard cut at target_size.
 
         Args:
             words (list): The list of words to find a break point in.
@@ -66,24 +68,15 @@ class TextChunker:
         if len(words) <= target_size:
             return len(words)
 
-        break_points = []
-
-        for i, word in enumerate(words[: target_size + 3]):
-            word_lower = word.lower()
-
-            priority = self.semantic_breaks.get(word_lower, 0)
+        for i in range(target_size - 1, -1, -1):
+            priority = self.semantic_breaks.get(words[i].lower(), 0)
             for punct, punct_priority in self.punctuation_priorities.items():
-                if word.endswith(punct):
+                if words[i].endswith(punct):
                     priority = max(priority, punct_priority)
-
             if priority > 0:
-                break_points.append((i, priority, -abs(i - target_size)))
+                return i + 1
 
-        if not break_points:
-            return target_size
-
-        break_points.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        return break_points[0][0] + 1
+        return target_size
 
     def process(self, text: str, audio_queue) -> str:
         """Process text chunk and return remaining text.
