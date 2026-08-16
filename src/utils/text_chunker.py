@@ -33,8 +33,20 @@ class TextChunker:
             "-": 2,
         }
 
+    def _natural_break_priority(self, word: str) -> int:
+        """Priority of the natural break at `word` (0 = none)."""
+        priority = self.semantic_breaks.get(word.lower(), 0)
+        for punct, punct_priority in self.punctuation_priorities.items():
+            if word.endswith(punct):
+                priority = max(priority, punct_priority)
+        return priority
+
     def should_process(self, text: str) -> bool:
         """Determines if text should be processed based on length or punctuation.
+
+        Fires when a completed sentence (trailing punctuation) lands, or once the
+        stream has MORE than the target word count with a natural break available
+        in the scan window, so the greedy cut starts TTS at a real break.
 
         Args:
             text (str): The text to check.
@@ -42,16 +54,22 @@ class TextChunker:
         Returns:
             bool: True if the text should be processed, False otherwise.
         """
+        words = text.split()
+        if not words:
+            return False
+
         if any(text.endswith(p) for p in self.punctuation_priorities):
             return True
 
-        words = text.split()
         target = (
             settings.FIRST_SENTENCE_SIZE
             if not self.found_first_sentence
             else settings.TARGET_SIZE
         )
-        return len(words) >= target
+        if len(words) <= target:
+            return False
+
+        return any(self._natural_break_priority(w) > 0 for w in words[:target])
 
     def find_break_point(self, words: list, target_size: int) -> int:
         """Finds the greedy break point in text: the furthest natural break
@@ -69,11 +87,7 @@ class TextChunker:
             return len(words)
 
         for i in range(target_size - 1, -1, -1):
-            priority = self.semantic_breaks.get(words[i].lower(), 0)
-            for punct, punct_priority in self.punctuation_priorities.items():
-                if words[i].endswith(punct):
-                    priority = max(priority, punct_priority)
-            if priority > 0:
+            if self._natural_break_priority(words[i]) > 0:
                 return i + 1
 
         return target_size

@@ -3,8 +3,6 @@ from pathlib import Path
 from typing import Optional
 import pyaudio
 import numpy as np
-import torch
-from torch.nn.functional import pad
 import threading
 import time
 from queue import Queue
@@ -22,6 +20,8 @@ MAX_SILENCE_DURATION = settings.MAX_SILENCE_DURATION
 
 def inference_device() -> str:
     """Pick the best inference device: GPU when available, else CPU."""
+    import torch
+
     try:
         if torch.cuda.is_available():
             return "cuda"
@@ -229,6 +229,9 @@ def detect_speech_segments(pipeline, audio_data, sample_rate=None):
 
     if len(audio_data.shape) == 1:
         audio_data = audio_data.reshape(1, -1)
+
+    import torch
+    from torch.nn.functional import pad
 
     if not isinstance(audio_data, torch.Tensor):
         audio_data = torch.from_numpy(audio_data)
@@ -649,6 +652,8 @@ def transcribe_audio(processor, model, audio_data, sampling_rate=None):
 
     if audio_data is None:
         return ""
+
+    import torch
 
     if isinstance(audio_data, torch.Tensor):
         audio_data = audio_data.cpu().numpy()

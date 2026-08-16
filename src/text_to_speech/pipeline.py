@@ -231,6 +231,7 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
     played_any = False
     wait_start = None
     gaps: list[float] = []
+    primed = False
 
     try:
         player = TurnAudioPlayer(
@@ -255,6 +256,14 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
                 player.stop()
                 time.sleep(settings.PLAYBACK_DELAY)
                 continue
+
+            # One-chunk lookahead: don't start playback until a 2nd chunk is
+            # synthesized, so the player always opens with ≥1 chunk buffered
+            # (absorbs synthesis lag behind the current chunk).
+            if not primed and audio_queue.is_running and audio_queue.audio_queue.qsize() < 2:
+                time.sleep(settings.PLAYBACK_DELAY)
+                continue
+            primed = True
 
             audio_data, sentence, is_first = audio_queue.get_next_audio()
             if audio_data is not None:

@@ -41,4 +41,27 @@ t = words(24)
 t[21] = "done."
 assert c.find_break_point(t, 20) == 20
 
+# ---- should_process trigger ----
+from src.utils.config import settings
+
+settings.FIRST_SENTENCE_SIZE = 5
+settings.TARGET_SIZE = 5
+
+c2 = TextChunker()
+
+# Completed sentence (trailing punctuation) fires at any length
+assert c2.should_process("umm,")
+assert c2.should_process("hi there.")
+
+# Fewer than target words, no trailing punctuation -> wait
+assert not c2.should_process("a b c d")
+
+# More than target words with a natural break in the scan window -> fire
+t = " ".join(words(8))
+t = t.replace("w4", "and")   # break at index 4, inside the 5-word window
+assert c2.should_process(t), t
+
+# More than target words but no break in the scan window -> wait (no hard cut)
+assert not c2.should_process(" ".join(words(8)))
+
 print("test_text_chunker: OK")

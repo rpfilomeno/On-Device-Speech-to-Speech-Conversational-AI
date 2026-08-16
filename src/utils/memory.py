@@ -6,8 +6,6 @@ from uuid import uuid4
 
 import numpy as np
 import requests
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from .config import log_error
 
@@ -48,6 +46,9 @@ class Memory(_BaseMemory):
     """
 
     def __init__(self, host: str, embed_url: str, embed_model: str, collection: str = "conversation_memory"):
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Distance, PointStruct, VectorParams
+
         super().__init__(embed_url, embed_model)
         self.client = QdrantClient(url=host, timeout=10)
         self.collection = collection
@@ -62,6 +63,8 @@ class Memory(_BaseMemory):
         if self._ready:
             return
         if not self.client.collection_exists(self.collection):
+            from qdrant_client.models import Distance, VectorParams
+
             # Need the embedding dimension before we can create the collection.
             dim = len(self._embed("ping"))
             self.client.create_collection(
@@ -74,6 +77,8 @@ class Memory(_BaseMemory):
         """Persist one turn (role is 'user' or 'assistant')."""
         self._ensure_ready()
         vector = self._embed(content)
+        from qdrant_client.models import PointStruct
+
         self.client.upsert(
             self.collection,
             points=[

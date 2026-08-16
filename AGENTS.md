@@ -6,7 +6,7 @@ Real-time local speech-to-speech chatbot: VAD → Whisper → LLM (Ollama/LM Stu
 
 - Setup: `uv sync` (source of truth is `pyproject.toml`; `requirements.txt` is a stale fallback). Copy `.env.template` → `.env` and fill in `HUGGINGFACE_TOKEN`.
 - Run: `uv run speech_to_speech.py` (Textual TUI). **Voice input starts OFF** — VAD/Whisper load on `/voice on`. `t` focuses the text input, Esc unfocuses it. Quit via `System` → `(Q)uit` or `/quit` (both confirm); `q`/`Ctrl+Q` do NOT quit. `hello.py` is the `uv init` scaffold — ignore it.
-- Tests: runnable self-checks in `tests/`, no pytest. `uv run python tests/test_barge_in.py`, `tests/test_barge_command.py`, `tests/test_history_trim.py`, `tests/test_text_history_trim.py`, and `tests/test_text_chunker.py` are plain asserts; `tests/test_idle.py` uses stdlib unittest. Some are slow to start (importing `speech_to_speech.py` pulls in transformers + textual).
+- Tests: runnable self-checks in `tests/`, no pytest. `uv run python tests/test_barge_in.py`, `tests/test_barge_command.py`, `tests/test_history_trim.py`, `tests/test_text_history_trim.py`, and `tests/test_text_chunker.py` are plain asserts; `tests/test_idle.py` uses stdlib unittest. Imports are lazy (transformers/torch/qdrant load only on `/voice on` / `/memory on`), so startup and tests are quick.
 - Typecheck: pyrefly (dev dep) is the configured typechecker and the OpenCode LSP (`opencode.json`). No lint tool, no CI.
 
 ## Runtime requirements (not in code)
