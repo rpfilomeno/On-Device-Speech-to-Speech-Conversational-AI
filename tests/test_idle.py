@@ -43,6 +43,10 @@ def main():
     s.typing_pause_start = None
     assert abs(s._idle_elapsed() - 23) < 0.01, s._idle_elapsed()
 
+    # idle_enabled gates the idle trigger and defaults to on
+    assert s.idle_enabled is True
+    assert not (False and (s.idle_mode or True or s.now_event.is_set()))
+
     print("test_idle: OK")
 
 

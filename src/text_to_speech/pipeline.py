@@ -128,6 +128,8 @@ def process_input(
 
             chunker = TextChunker()
             complete_response = []
+            stream_tokens = 0
+            stream_start = None
             for chunk in response_stream:
                 if state.interrupt_event.is_set():
                     state.emit("log", "[Command] Stop: stream aborted.")
@@ -142,6 +144,9 @@ def process_input(
                     if content:
                         if not state.timing_info["llm_first_token"]:
                             state.timing_info["llm_first_token"] = time.perf_counter()
+                        if stream_start is None:
+                            stream_start = time.perf_counter()
+                        stream_tokens += 1
                         state.emit("bot_token", content)
                         chunker.current_text.append(content)
 
@@ -157,6 +162,9 @@ def process_input(
 
                 if choice.get("finish_reason") == "stop":
                     break
+
+            if stream_start is not None:
+                state.record_llm_stream(stream_tokens, time.perf_counter() - stream_start)
 
             final_flushed = chunker.flush(audio_queue)
             if final_flushed:
@@ -459,9 +467,12 @@ def pipeline_main():
 
             idle_elapsed = state._idle_elapsed()
             if (
-                state.idle_mode
-                or (not typing_active and idle_elapsed >= settings.MAX_IDLE_TIME)
-                or state.now_event.is_set()
+                state.idle_enabled
+                and (
+                    state.idle_mode
+                    or (not typing_active and idle_elapsed >= settings.MAX_IDLE_TIME)
+                    or state.now_event.is_set()
+                )
             ):
                 if not state.idle_mode:
                     state.idle_mode = True

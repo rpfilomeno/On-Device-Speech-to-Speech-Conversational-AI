@@ -68,6 +68,20 @@ timing_info: dict[str, float | None] = {
     "transcription_duration": None,
 }
 
+# Cumulative LLM streaming rate: tokens delivered / seconds spent streaming.
+llm_rate_tokens = 0
+llm_rate_seconds = 0.0
+
+
+def llm_tokens_per_sec() -> float:
+    return llm_rate_tokens / llm_rate_seconds if llm_rate_seconds else 0.0
+
+
+def _record_llm_stream(tokens: int, seconds: float) -> None:
+    global llm_rate_tokens, llm_rate_seconds
+    llm_rate_tokens += tokens
+    llm_rate_seconds += seconds
+
 
 def emit(kind: str, *payload):
     """Post an event to the TUI's event queue (thread-safe)."""
@@ -357,6 +371,8 @@ def process_input(
 
             chunker = TextChunker()
             complete_response = []
+            stream_tokens = 0
+            stream_start = None
             for chunk in response_stream:
                 if interrupt_event.is_set():
                     emit("log", "[Command] Stop: stream aborted.")
@@ -371,6 +387,9 @@ def process_input(
                     if content:
                         if not timing_info["llm_first_token"]:
                             timing_info["llm_first_token"] = time.perf_counter()
+                        if stream_start is None:
+                            stream_start = time.perf_counter()
+                        stream_tokens += 1
                         emit("bot_token", content)
                         chunker.current_text.append(content)
 
@@ -386,6 +405,9 @@ def process_input(
 
                 if choice.get("finish_reason") == "stop":
                     break
+
+            if stream_start is not None:
+                _record_llm_stream(stream_tokens, time.perf_counter() - stream_start)
 
             final_flushed = chunker.flush(audio_queue)
             if final_flushed:
@@ -625,7 +647,20 @@ pipeline_last_activity: float = time.time()
 last_typing_activity: float = 0.0
 typing_pause_start: float | None = None
 idle_mode: bool = False
+idle_enabled: bool = True
 _TYPING_PAUSE_SECONDS = 5.0
+
+
+def _time_ago(ts: float) -> str:
+    """Human-readable 'X ago' for a past timestamp."""
+    s = max(0, int(time.time() - ts))
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s ago"
+    if s < 86400:
+        return f"{s // 3600}h {s % 3600 // 60}m ago"
+    return f"{s // 86400}d {s % 86400 // 3600}h ago"
 
 
 def _idle_elapsed() -> float:
@@ -844,9 +879,12 @@ def pipeline_main():
 
                 idle_elapsed = _idle_elapsed()
                 if (
-                    idle_mode
-                    or (not typing_active and idle_elapsed >= settings.MAX_IDLE_TIME)
-                    or now_event.is_set()
+                    idle_enabled
+                    and (
+                        idle_mode
+                        or (not typing_active and idle_elapsed >= settings.MAX_IDLE_TIME)
+                        or now_event.is_set()
+                    )
                 ):
                     if not idle_mode:
                         idle_mode = True
@@ -954,7 +992,7 @@ SLASH_COMMANDS = [
     ("/clear", "Clear the chat display"),
     ("/stop", "Interrupt the current playback / response"),
     ("/now", "Trigger the idle event immediately"),
-    ("/idle", "Enter idle mode now (same as /now)"),
+    ("/idle", "Enter idle mode now; /idle off disables+resets the countdown, /idle on re-enables it"),
     ("/pause", "Suspend voice output and the idle countdown"),
     ("/play", "Resume from pause"),
     ("/slap", "Erase queued Twitch messages, or /slap @user for just theirs"),
@@ -1310,6 +1348,7 @@ class SpeechTUI(App):
     #status-text { text-style: bold; height: 1; }
     #idle-bar { height: 1; margin: 0 1 1 1; }
     #last-activity { color: $text-muted; height: 1; }
+    #llm-rate { color: $text-muted; height: 1; }
     #status-bar { dock: bottom; height: 1; color: $text; background: $panel; padding: 0 1; }
     #text-input { dock: bottom; height: 3; }
     #cmd-suggestions {
@@ -1361,6 +1400,7 @@ class SpeechTUI(App):
                         yield ProgressBar(total=settings.MAX_IDLE_TIME, show_eta=False, show_percentage=False, id="idle-bar")
                         yield Label(id="idle-count")
                         yield Label(id="last-activity")
+                        yield Label(id="llm-rate")
             yield Static(id="status-bar")
             yield Static(id="cmd-suggestions")
             yield ChatInput(id="text-input", placeholder="Type a message for the bot, or / for commands. Enter to send.")
@@ -1379,6 +1419,7 @@ class SpeechTUI(App):
         self.idle_bar: ProgressBar = self.query_one("#idle-bar", ProgressBar)
         self.idle_count: Label = self.query_one("#idle-count", Label)
         self.last_activity_label: Label = self.query_one("#last-activity", Label)
+        self.llm_rate_label: Label = self.query_one("#llm-rate", Label)
 
         _install_error_routing()
         self.set_interval(0.1, self._poll_events)
@@ -1451,8 +1492,23 @@ class SpeechTUI(App):
         self._bot_reply("Idle countdown set to zero — I'll start talking now.")
 
     def _cmd_idle(self, arg=""):
-        now_event.set()
-        self._bot_reply("Entering idle mode — I'll start talking now.")
+        global idle_enabled, pipeline_last_activity, idle_mode
+        arg = arg.strip().lower()
+        if arg == "off":
+            idle_enabled = False
+            pipeline_last_activity = time.time()
+            idle_mode = False
+            now_event.clear()
+            emit("status", "LISTENING")
+            self._bot_reply("Idle countdown disabled and reset. Type /idle on to re-enable.")
+        elif arg == "on":
+            idle_enabled = True
+            pipeline_last_activity = time.time()
+            now_event.clear()
+            self._bot_reply("Idle countdown enabled.")
+        else:
+            now_event.set()
+            self._bot_reply("Entering idle mode — I'll start talking now.")
 
     def _cmd_pause(self, arg=""):
         pause_event.set()
@@ -1609,8 +1665,11 @@ class SpeechTUI(App):
         try:
             left = f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]"
             if self.status == "LISTENING":
-                remaining = max(0.0, settings.MAX_IDLE_TIME - _idle_elapsed())
-                mid = f"idle [bold]{remaining:5.1f}s[/]"
+                if idle_enabled:
+                    remaining = max(0.0, settings.MAX_IDLE_TIME - _idle_elapsed())
+                    mid = f"idle [bold]{remaining:5.1f}s[/]"
+                else:
+                    mid = "idle [bold]off[/]"
             else:
                 mid = f"in turn: {self.status}"
             parts = [left, mid, f"twitch [bold]{self._twitch_count}[/] pending"]
@@ -1627,15 +1686,20 @@ class SpeechTUI(App):
         try:
             self.status_text.update(f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]")
             if self.status == "LISTENING":
-                remaining = max(0.0, settings.MAX_IDLE_TIME - _idle_elapsed())
-                self.idle_count.update(f"idle in [bold]{remaining:5.1f}s[/]")
-                self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
+                if idle_enabled:
+                    remaining = max(0.0, settings.MAX_IDLE_TIME - _idle_elapsed())
+                    self.idle_count.update(f"idle in [bold]{remaining:5.1f}s[/]")
+                    self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
+                else:
+                    self.idle_count.update("idle [bold]off[/]")
+                    self.idle_bar.update(progress=0, total=settings.MAX_IDLE_TIME)
             else:
                 self.idle_count.update(f"in turn: {self.status}")
                 self.idle_bar.update(progress=settings.MAX_IDLE_TIME, total=settings.MAX_IDLE_TIME)
             self.last_activity_label.update(
-                f"Last activity: {time.strftime('%H:%M:%S', time.localtime(pipeline_last_activity))}"
+                f"Last activity: {_time_ago(pipeline_last_activity)}"
             )
+            self.llm_rate_label.update(f"LLM: [bold]{llm_tokens_per_sec():.1f}[/] tok/s")
         except Exception as e:
             log_error(e)
             self._log_tui_error("idle pane", e)

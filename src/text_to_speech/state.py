@@ -45,6 +45,20 @@ timing_info: dict[str, float | None] = {
     "transcription_duration": None,
 }
 
+# Cumulative LLM streaming rate: tokens delivered / seconds spent streaming.
+llm_rate_tokens = 0
+llm_rate_seconds = 0.0
+
+
+def record_llm_stream(tokens: int, seconds: float) -> None:
+    global llm_rate_tokens, llm_rate_seconds
+    llm_rate_tokens += tokens
+    llm_rate_seconds += seconds
+
+
+def llm_tokens_per_sec() -> float:
+    return llm_rate_tokens / llm_rate_seconds if llm_rate_seconds else 0.0
+
 
 def emit(kind: str, *payload):
     """Post an event to the TUI's event queue (thread-safe)."""
@@ -77,6 +91,7 @@ pipeline_last_activity: float = time.time()
 last_typing_activity: float = 0.0
 typing_pause_start: float | None = None
 idle_mode: bool = False
+idle_enabled: bool = True
 _TYPING_PAUSE_SECONDS = 5.0
 
 
@@ -86,3 +101,15 @@ def _idle_elapsed() -> float:
     if typing_pause_start is not None and now - last_typing_activity < _TYPING_PAUSE_SECONDS:
         return max(0.0, typing_pause_start - pipeline_last_activity)
     return now - pipeline_last_activity
+
+
+def _time_ago(ts: float) -> str:
+    """Human-readable 'X ago' for a past timestamp."""
+    s = max(0, int(time.time() - ts))
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s ago"
+    if s < 86400:
+        return f"{s // 3600}h {s % 3600 // 60}m ago"
+    return f"{s // 86400}d {s % 86400 // 3600}h ago"
