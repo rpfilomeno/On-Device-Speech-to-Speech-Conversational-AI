@@ -506,7 +506,7 @@ def pipeline_main():
                         TWITCH_CHATS_AND_EVENTS=events_summary
                     )
                     state.emit("log", f"[Twitch Idle Event] Responding to {len(twitch_events)} collected Twitch event(s)...")
-                    state.emit("transcript", "idle", prompt_text)
+                    state.emit("transcript", "twitch", prompt_text)
                 else:
                     idle_prompts = settings.get_idle_prompts_list()
                     choices = [p for p in idle_prompts if p != state._last_idle_prompt] or idle_prompts

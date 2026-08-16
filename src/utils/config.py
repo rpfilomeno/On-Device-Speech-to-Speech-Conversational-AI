@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     # Max fraction of the context window the prompt (history) may use, so the
     # model always has headroom left to generate a full response.
     CONTEXT_TRIM_RATIO: float = Field(default=0.8)
+    # Jitter margin (ms) for the TTS target-size learner: the largest TARGET_SIZE
+    # whose mean jitter is within this margin of the best (lowest) jitter wins,
+    # keeping chunk size high without letting latency degrade.
+    JITTER_MARGIN_MS: float = Field(default=100.0)
     LLM_TEMPERATURE: float = Field(default=0.7)
 
     QDRANT_HOST: Optional[str] = Field(default="")

@@ -653,7 +653,8 @@ class TextSpeechTUI(App):
                 t.append(f"You ({source}): ", style="bold #7fd8a4")
                 t.append(text)
                 self._chat_line(t)
-                state._append_chat_file("in.txt", text)
+                if source != "twitch":
+                    state._append_chat_file("in.txt", text)
             elif kind == "bot_token":
                 self._stream_buf += payload[0]
                 self._render_live()

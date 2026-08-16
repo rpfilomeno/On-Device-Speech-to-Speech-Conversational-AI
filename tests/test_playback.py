@@ -60,14 +60,19 @@ class TestJitterLearner(unittest.TestCase):
     def setUp(self):
         s._jitter_samples = {}
 
-    def test_picks_lowest_mean_jitter_bucket(self):
+    def test_prefers_largest_within_jitter_margin(self):
         self.assertIsNone(s._record_jitter(10, 100.0))
         self.assertIsNone(s._record_jitter(10, 120.0))
-        self.assertEqual(s._record_jitter(10, 110.0), 10)
-        self.assertEqual(s._record_jitter(6, 40.0), 10)
+        self.assertEqual(s._record_jitter(10, 110.0), 10)  # only eligible bucket
+        self.assertEqual(s._record_jitter(6, 40.0), 10)    # 6 not enough samples yet
         self.assertEqual(s._record_jitter(6, 60.0), 10)
-        self.assertEqual(s._record_jitter(6, 50.0), 6)
-        self.assertEqual(s._best_target_size(), 6)
+        # 6@50 has the best jitter, but 10@110 is within JITTER_MARGIN_MS of it -> 10 wins
+        self.assertEqual(s._record_jitter(6, 50.0), 10)
+        self.assertEqual(s._best_target_size(), 10)
+        # A size whose jitter is far above the margin is rejected
+        s._record_jitter(20, 900.0)
+        s._record_jitter(20, 900.0)
+        self.assertEqual(s._record_jitter(20, 900.0), 10)  # 20@900 above ceiling
 
     def test_needs_min_samples_per_bucket(self):
         s._record_jitter(6, 10.0)

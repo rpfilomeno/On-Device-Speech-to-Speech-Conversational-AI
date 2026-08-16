@@ -523,15 +523,21 @@ _MIN_JITTER_SAMPLES = 3
 
 
 def _best_target_size() -> int | None:
-    """Target size with the lowest mean jitter, among buckets with enough samples."""
-    best = None
-    for size, samples in _jitter_samples.items():
-        if len(samples) < _MIN_JITTER_SAMPLES:
-            continue
-        mean = sum(samples) / len(samples)
-        if best is None or mean < best[1]:
-            best = (size, mean)
-    return best[0] if best else None
+    """Largest TARGET_SIZE whose mean jitter stays within JITTER_MARGIN_MS of the
+    best (lowest) jitter. Keeps chunk size high while latency is acceptable;
+    only a size with meaningfully worse jitter is rejected. Falls back to the
+    lowest-jitter bucket when only it qualifies."""
+    eligible = [
+        (size, sum(samples) / len(samples))
+        for size, samples in _jitter_samples.items()
+        if len(samples) >= _MIN_JITTER_SAMPLES
+    ]
+    if not eligible:
+        return None
+    best_jitter = min(m for _, m in eligible)
+    ceiling = best_jitter + settings.JITTER_MARGIN_MS
+    acceptable = [size for size, m in eligible if m <= ceiling]
+    return max(acceptable) if acceptable else min(eligible)[0]
 
 
 def _record_jitter(target_size: int, jitter_ms: float) -> int | None:
@@ -1022,7 +1028,7 @@ def pipeline_main():
                             TWITCH_CHATS_AND_EVENTS=events_summary
                         )
                         emit("log", f"[Twitch Idle Event] Responding to {len(twitch_events)} collected Twitch event(s)...")
-                        emit("transcript", "idle", prompt_text)
+                        emit("transcript", "twitch", prompt_text)
                     else:
                         idle_prompts = settings.get_idle_prompts_list()
                         choices = [p for p in idle_prompts if p != _last_idle_prompt] or idle_prompts
@@ -1831,7 +1837,8 @@ class SpeechTUI(App):
                 t.append(f"You ({source}): ", style="bold #7fd8a4")
                 t.append(text)
                 self._chat_line(t)
-                _append_chat_file("in.txt", text)
+                if source != "twitch":
+                    _append_chat_file("in.txt", text)
             elif kind == "bot_token":
                 self._stream_buf += payload[0]
                 self._render_live()
