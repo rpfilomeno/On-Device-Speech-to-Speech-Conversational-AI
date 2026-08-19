@@ -23,6 +23,8 @@ class Settings(BaseSettings):
 
     POCKET_TTS_URL: str = Field(default="http://host.docker.internal:49112/")
     POCKET_TTS_VOICE: str = Field(default="Jelai.wav")
+    CF_ACCESS_CLIENT_ID: Optional[str] = Field(default="")
+    CF_ACCESS_CLIENT_SECRET: Optional[str] = Field(default="")
     SPEED: float = Field(default=1.0)
     TTS_MAX_RETRIES: int = Field(default=3)
     HUGGINGFACE_TOKEN: Optional[str] = Field(default="")

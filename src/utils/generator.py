@@ -73,10 +73,15 @@ class VoiceGenerator:
 
         endpoint = f"{self.pocket_tts_url}/v1/audio/speech"
 
+        headers = {}
+        if settings.CF_ACCESS_CLIENT_ID and settings.CF_ACCESS_CLIENT_SECRET:
+            headers["CF-Access-Client-Id"] = settings.CF_ACCESS_CLIENT_ID
+            headers["CF-Access-Client-Secret"] = settings.CF_ACCESS_CLIENT_SECRET
+
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                res = requests.post(endpoint, json=payload, stream=True, timeout=10)
+                res = requests.post(endpoint, json=payload, stream=True, timeout=10, headers=headers)
                 res.raise_for_status()
 
                 if stream:
