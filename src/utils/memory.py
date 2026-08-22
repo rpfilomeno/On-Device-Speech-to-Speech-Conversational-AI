@@ -1,153 +1,90 @@
 import logging
+import os
 import queue
 import threading
-import time
-from uuid import uuid4
 
-import numpy as np
 import requests
 
-from .config import log_error
-
-# Only recall memories that are at least this semantically similar to the query.
-MIN_SCORE = 0.4
+from .config import log_error, settings
 
 
-class _BaseMemory:
-    """Shared embedding source for both the Qdrant and RAM implementations."""
+class Mem0Memory:
+    """Long-term conversational memory backed by mem0 (file-based).
 
-    def __init__(self, embed_url: str, embed_model: str):
-        self.embed_url = embed_url.rstrip("/")
-        self.embed_model = embed_model
+    mem0 runs fully local: the vector store is an embedded qdrant collection on
+    disk under settings.MEM0_DIR and the change history is a SQLite file next to
+    it — no server. Fact extraction uses the LLM server's OpenAI-compatible API,
+    embeddings use its /v1/embeddings endpoint. Memories persist across restarts.
+    """
 
-    def store(self, role: str, content: str):
-        raise NotImplementedError
+    USER_ID = "user"
 
-    def search(self, query: str, limit: int = 5) -> list[str]:
-        raise NotImplementedError
+    def __init__(self):
+        # mem0's OpenAI clients refuse to init without any key set, even when
+        # pointed at LM Studio.
+        os.environ.setdefault("OPENAI_API_KEY", "dummy")
+        from mem0 import Memory
 
-    def _embed(self, text: str) -> list[float]:
+        # Probe the embedding dimension (model-dependent) so the collection is
+        # created with the right size.
         res = requests.post(
-            f"{self.embed_url}/embeddings",
-            json={"model": self.embed_model, "input": text},
+            f"{settings.LM_STUDIO_URL.rstrip('/')}/embeddings",
+            json={"model": settings.EMBEDDING_MODEL, "input": "ping"},
             timeout=10,
         )
         res.raise_for_status()
-        return res.json()["data"][0]["embedding"]
+        dims = len(res.json()["data"][0]["embedding"])
 
-
-class Memory(_BaseMemory):
-    """Long-term conversational memory backed by Qdrant.
-
-    Each user/assistant turn is embedded (via the LLM server's OpenAI-compatible
-    /v1/embeddings endpoint) and stored in a Qdrant collection. On every new input
-    the most similar past turns are recalled and injected into the prompt, so the
-    bot remembers across sessions and restarts.
-    """
-
-    def __init__(self, host: str, embed_url: str, embed_model: str, collection: str = "conversation_memory"):
-        from qdrant_client import QdrantClient
-        from qdrant_client.models import Distance, PointStruct, VectorParams
-
-        super().__init__(embed_url, embed_model)
-        self.client = QdrantClient(url=host, timeout=10)
-        self.collection = collection
-        self._ready = False
-
-    def check(self):
-        """Raise if the Qdrant server is unreachable (e.g. for a startup probe)."""
-        self.client.get_collections()
-
-    def _ensure_ready(self):
-        """Create the collection if it doesn't exist yet (once per process)."""
-        if self._ready:
-            return
-        if not self.client.collection_exists(self.collection):
-            from qdrant_client.models import Distance, VectorParams
-
-            # Need the embedding dimension before we can create the collection.
-            dim = len(self._embed("ping"))
-            self.client.create_collection(
-                self.collection,
-                vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
-            )
-        self._ready = True
-
-    def store(self, role: str, content: str):
-        """Persist one turn (role is 'user' or 'assistant')."""
-        self._ensure_ready()
-        vector = self._embed(content)
-        from qdrant_client.models import PointStruct
-
-        self.client.upsert(
-            self.collection,
-            points=[
-                PointStruct(
-                    id=uuid4().int & ((1 << 63) - 1),
-                    vector=vector,
-                    payload={"role": role, "content": content, "ts": time.time()},
-                )
-            ],
-        )
-
-    def search(self, query: str, limit: int = 5) -> list[str]:
-        """Return the contents of the most similar stored turns."""
-        self._ensure_ready()
-        vector = self._embed(query)
-        result = self.client.query_points(
-            self.collection, query=vector, limit=limit, score_threshold=MIN_SCORE
-        )
-        return [
-            p.payload.get("content")
-            for p in result.points
-            if p.payload and p.payload.get("content")
-        ]
-
-
-class RamMemory(_BaseMemory):
-    """In-process fallback: same embedding-based recall as Memory, but nothing is
-    persisted (lost when the app exits). Used when Qdrant is unavailable."""
-
-    def __init__(self, embed_url: str, embed_model: str):
-        super().__init__(embed_url, embed_model)
-        self._points: list[dict] = []
-
-    def store(self, role: str, content: str):
-        """Keep one turn in the in-process list (role is 'user' or 'assistant')."""
-        self._points.append(
+        self.client = Memory.from_config(
             {
-                "vector": self._embed(content),
-                "role": role,
-                "content": content,
-                "ts": time.time(),
+                "llm": {
+                    "provider": "lmstudio",
+                    "config": {
+                        "model": settings.LLM_MODEL,
+                        "lmstudio_base_url": settings.LM_STUDIO_URL,
+                        # mem0 defaults to json_object, which some LM Studio
+                        # builds reject ("type must be json_schema or text").
+                        "lmstudio_response_format": {"type": "text"},
+                    },
+                },
+                "embedder": {
+                    "provider": "lmstudio",
+                    "config": {"model": settings.EMBEDDING_MODEL},
+                },
+                "vector_store": {
+                    "provider": "qdrant",
+                    "config": {
+                        "path": str(settings.MEM0_DIR),
+                        "collection_name": "conversation_memory",
+                        "embedding_model_dims": dims,
+                    },
+                },
+                "history_db_path": str(settings.MEM0_DIR / "history.db"),
             }
         )
 
+    def store(self, role: str, content: str):
+        """Persist one turn (role is 'user' or 'assistant'); mem0 extracts facts via the LLM."""
+        self.client.add([{"role": role, "content": content}], user_id=self.USER_ID)
+
     def search(self, query: str, limit: int = 5) -> list[str]:
-        """Return the contents of the most similar stored turns (cosine)."""
-        query_vec = np.asarray(self._embed(query))
-        query_norm = np.linalg.norm(query_vec)
-        results = []
-        for point in self._points:
-            vec = np.asarray(point["vector"])
-            score = float(np.dot(query_vec, vec) / (query_norm * np.linalg.norm(vec)))
-            if score >= MIN_SCORE:
-                results.append((score, point["content"]))
-        results.sort(key=lambda r: -r[0])
-        return [content for _, content in results[:limit]]
+        """Return the most relevant extracted memories for the query."""
+        # ponytail: mem0's stubs mistype search(); it actually returns list[dict]
+        results = self.client.search(query, filters={f"user_id": self.USER_ID}, limit=limit)  # pyrefly: ignore[bad-assignment]
+        return [r["memory"] for r in results if isinstance(r, dict) and r.get("memory")]  # pyrefly: ignore[bad-index, missing-attribute]
 
 
 class MemoryWorker:
-    """Runs all embedding work (store + recall) on a background thread so the
-    conversation loop is never blocked by embedding HTTP calls.
+    """Runs all mem0 work (store + recall) on a background thread so the
+    conversation loop is never blocked by embedding/LLM calls.
 
-    Exposes the same store/search interface as Memory/RamMemory:
+    Exposes the same store/search interface as Mem0Memory:
       - store() is fire-and-forget (jobs are dropped, never block, if the worker
         is backed up).
       - search() submits a recall job and blocks until the worker returns it.
     """
 
-    def __init__(self, memory: _BaseMemory, max_queue: int = 50):
+    def __init__(self, memory: Mem0Memory, max_queue: int = 50):
         self._memory = memory
         self._jobs: queue.Queue = queue.Queue(maxsize=max_queue)
         self._thread = threading.Thread(target=self._run, daemon=True)

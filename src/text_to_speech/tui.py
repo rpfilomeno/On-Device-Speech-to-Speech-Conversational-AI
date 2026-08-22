@@ -30,11 +30,12 @@ SLASH_COMMANDS = [
     ("/clear", "Clear the chat display"),
     ("/stop", "Interrupt the current playback / response"),
     ("/now", "Trigger the idle event immediately"),
-    ("/idle", "Enter idle mode now; /idle off disables+resets the countdown, /idle on re-enables it"),
+    ("/idle", "Show idle status; /idle on|off toggles random idle prompts (countdown stops only when Twitch prompts are off too)"),
+    ("/twitch", "Show Twitch prompt status; /twitch on|off toggles using Twitch chats as prompts"),
     ("/pause", "Suspend voice output and the idle countdown"),
     ("/play", "Resume from pause"),
     ("/slap", "Erase queued Twitch messages, or /slap @user for just theirs"),
-    ("/memory", "Show memory status; /memory on|off toggles Qdrant long-term memory (RAM fallback)"),
+    ("/memory", "Show memory status; /memory on|off toggles mem0 long-term memory (file-based)"),
     ("/new", "Start a new chat session (clears LLM history)"),
     ("/help", "Show this list of slash commands"),
 ]
@@ -411,6 +412,7 @@ class TextSpeechTUI(App):
                 "/stop": self._cmd_stop,
                 "/now": self._cmd_now,
                 "/idle": self._cmd_idle,
+                "/twitch": self._cmd_twitch,
                 "/pause": self._cmd_pause,
                 "/play": self._cmd_play,
                 "/slap": self._cmd_slap,
@@ -448,19 +450,42 @@ class TextSpeechTUI(App):
         arg = arg.strip().lower()
         if arg == "off":
             state.idle_enabled = False
-            state.pipeline_last_activity = time.time()
-            state.idle_mode = False
-            state.now_event.clear()
-            state.emit("status", "LISTENING")
-            self._bot_reply("Idle countdown disabled and reset. Type /idle on to re-enable.")
+            self._bot_reply("Idle prompts disabled. Countdown stops when Twitch prompts are off too.")
         elif arg == "on":
             state.idle_enabled = True
-            state.pipeline_last_activity = time.time()
-            state.now_event.clear()
-            self._bot_reply("Idle countdown enabled.")
+            self._bot_reply("Idle prompts enabled.")
         else:
-            state.now_event.set()
-            self._bot_reply("Entering idle mode — I'll start talking now.")
+            enabled = "on" if state.idle_enabled else "off"
+            twitch = "on" if state.twitch_enabled else "off"
+            if state.idle_enabled or state.twitch_enabled:
+                remaining = max(0.0, settings.MAX_IDLE_TIME - state._idle_elapsed())
+                countdown = f"{remaining:.1f}s until next idle turn"
+                if state.idle_mode:
+                    countdown = "in idle mode now"
+            else:
+                countdown = "countdown stopped (both prompt sources off)"
+            self._bot_reply(
+                f"Idle prompts: {enabled} | Twitch prompts: {twitch} | {countdown}. "
+                "Use /idle on|off and /twitch on|off to toggle; /now to trigger a turn now."
+            )
+
+    def _cmd_twitch(self, arg=""):
+        if not settings.TWITCH_CLIENT_CHANNEL:
+            self._bot_reply("Twitch is not configured (no TWITCH_CLIENT_CHANNEL set).")
+        elif arg == "off":
+            state.twitch_enabled = False
+            n = twitch_collector.clear_all()
+            self._bot_reply(f"Twitch prompts disabled; cleared {n} queued chat(s).")
+        elif arg == "on":
+            state.twitch_enabled = True
+            self._bot_reply(f"Twitch prompts enabled ({settings.TWITCH_CLIENT_CHANNEL}).")
+        else:
+            state_txt = "on" if state.twitch_enabled else "off"
+            n = len(twitch_collector.snapshot())
+            self._bot_reply(
+                f"Twitch prompts: {state_txt} | {n} queued chat(s) | channel: {settings.TWITCH_CLIENT_CHANNEL}. "
+                "Use /twitch on|off."
+            )
 
     def _cmd_pause(self, arg=""):
         state.pause_event.set()
@@ -491,10 +516,10 @@ class TextSpeechTUI(App):
         arg = arg.strip().lower()
         if arg == "on":
             if state.memory_status["enabled"]:
-                self._bot_reply(f"Qdrant long-term memory is already ON ({state.memory_status['backend']}).")
+                self._bot_reply(f"mem0 long-term memory is already ON ({state.memory_status['backend']}).")
             else:
                 state.memory_request_queue.put("on")
-                self._bot_reply("Switching to Qdrant long-term memory...")
+                self._bot_reply("Switching to mem0 long-term memory...")
         elif arg == "off":
             if not state.memory_status["enabled"]:
                 self._bot_reply("Long-term memory is already OFF.")
@@ -503,7 +528,7 @@ class TextSpeechTUI(App):
                 self._bot_reply("Switching off long-term memory...")
         else:
             if state.memory_status["enabled"]:
-                self._bot_reply(f"Qdrant long-term memory is ON ({state.memory_status['backend']}).")
+                self._bot_reply(f"mem0 long-term memory is ON ({state.memory_status['backend']}).")
             else:
                 self._bot_reply("Long-term memory is OFF.")
 
@@ -602,7 +627,7 @@ class TextSpeechTUI(App):
         try:
             left = f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]"
             if self.status == "LISTENING":
-                if state.idle_enabled:
+                if state.idle_enabled or state.twitch_enabled:
                     remaining = max(0.0, settings.MAX_IDLE_TIME - state._idle_elapsed())
                     mid = f"idle [bold]{remaining:5.1f}s[/]"
                 else:
@@ -623,9 +648,9 @@ class TextSpeechTUI(App):
         try:
             self.status_text.update(f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]")
             if self.status == "LISTENING":
-                if state.idle_enabled:
+                if state.idle_enabled or state.twitch_enabled:
                     remaining = max(0.0, settings.MAX_IDLE_TIME - state._idle_elapsed())
-                    self.idle_count.update(f"idle in [bold]{remaining:5.1f}s[/]")
+                    self.idle_count.update(f"auto in [bold]{remaining:5.1f}s[/]")
                     self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
                 else:
                     self.idle_count.update("idle [bold]off[/]")

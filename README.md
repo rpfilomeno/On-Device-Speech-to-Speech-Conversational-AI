@@ -35,16 +35,18 @@ This is a real-time conversational system for two-way speech communication with 
 | Command | Description |
 | --- | --- |
 | `/voice` | Show VAD/voice-transcription status; `/voice on` or `/voice off` to toggle |
-| `/memory` | Show memory status; `/memory on` uses Qdrant long-term memory, `/memory off` uses in-RAM memory |
+| `/memory` | Show memory status; `/memory on` uses mem0 long-term memory (file-based), `/memory off` disables it |
 | `/config` | Pick the microphone and speaker devices |
 | `/stop` | Interrupt the current playback / response |
 | `/pause` / `/play` | Suspend / resume voice output and the idle countdown |
 | `/now` | Trigger the idle event immediately |
+| `/idle` | Show idle status; `/idle on\|off` toggles random idle prompts (countdown stops only when Twitch prompts are off too) |
+| `/twitch` | Show Twitch prompt status; `/twitch on\|off` toggles using Twitch chats as prompts |
 | `/slap` | Erase queued Twitch messages, or `/slap @user` for just theirs |
 | `/clear` | Clear the chat display |
 | `/help` | Show the command list |
 
-Long-term memory defaults to RAM (in-process, lost on exit); `/memory on` switches to persistent Qdrant storage.
+Long-term memory defaults to off; `/memory on` switches to persistent mem0 storage (files under `data/memory/`, no server required).
 
 # How does it work?
 

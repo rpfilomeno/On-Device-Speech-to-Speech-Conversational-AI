@@ -44,8 +44,7 @@ class Settings(BaseSettings):
     # later results are applied to the next turn instead.
     MEMORY_RECALL_GRACE: float = Field(default=0.2)
 
-    QDRANT_HOST: Optional[str] = Field(default="")
-    QDRANT_COLLECTION: str = Field(default="conversation_memory")
+    MEM0_DIR: Path = BASE_DIR / "data" / "memory"
     EMBEDDING_MODEL: str = Field(default="text-embedding-nomic-embed-text-v1.5")
 
     # ASR (NVIDIA Parakeet TDT via onnx-asr; int8 ONNX weights)
@@ -104,6 +103,7 @@ class Settings(BaseSettings):
         self.MODELS_DIR.mkdir(parents=True, exist_ok=True)
         self.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         self.RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        self.MEM0_DIR.mkdir(parents=True, exist_ok=True)
 
     class Config:
         env_file = ".env"

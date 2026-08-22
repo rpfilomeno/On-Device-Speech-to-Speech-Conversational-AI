@@ -20,7 +20,7 @@ from src.utils import (
 from src.utils.audio_queue import AudioGenerationQueue
 from src.utils.config import log_error, settings
 from src.utils.llm import parse_stream_chunk, fetch_context_window
-from src.utils.memory import Memory, MemoryWorker, RamMemory
+from src.utils.memory import Mem0Memory, MemoryWorker
 from src.utils.speech import TurnAudioPlayer
 from src.utils.fillers import pick_filler
 from src.utils.text_chunker import TextChunker
@@ -330,25 +330,11 @@ def audio_playback_worker(audio_queue, filler_audio: np.ndarray | None = None) -
 
 
 def init_memory(mode: str) -> tuple[MemoryWorker | None, str]:
-    """Build a memory backend. mode='off' -> None (no embedding calls); mode='on' -> Qdrant (RAM fallback). Returns (worker, label)."""
+    """Build a memory backend. mode='off' -> None (no LLM/embedding calls); mode='on' -> mem0 (file-based). Returns (worker, label)."""
     if mode != "on":
         return None, "off"
-    try:
-        if not settings.QDRANT_HOST:
-            raise RuntimeError("QDRANT_HOST not set")
-        backend = Memory(
-            settings.QDRANT_HOST,
-            settings.LM_STUDIO_URL,
-            settings.EMBEDDING_MODEL,
-            collection=settings.QDRANT_COLLECTION,
-        )
-        backend.check()
-        label = f"Qdrant ({settings.QDRANT_HOST})"
-    except Exception as e:
-        log_error(e)
-        backend = RamMemory(settings.LM_STUDIO_URL, settings.EMBEDDING_MODEL)
-        label = f"RAM (Qdrant unavailable: {e})"
-    return MemoryWorker(backend), label
+    backend = Mem0Memory()
+    return MemoryWorker(backend), f"mem0 ({settings.MEM0_DIR})"
 
 
 def pipeline_main():
@@ -369,7 +355,7 @@ def pipeline_main():
 
         memory, label = init_memory("off")
         state.memory_status.update(enabled=False, backend=label)
-        state.emit("log", f"Long-term memory: {label} (use /memory on for Qdrant).")
+        state.emit("log", f"Long-term memory: {label} (use /memory on for mem0).")
 
         if settings.TWITCH_CLIENT_CHANNEL:
             state.emit("log", f"Starting Twitch chat collector for channel: {settings.TWITCH_CLIENT_CHANNEL}...")
@@ -475,7 +461,7 @@ def pipeline_main():
 
             idle_elapsed = state._idle_elapsed()
             if (
-                state.idle_enabled
+                (state.idle_enabled or state.twitch_enabled)
                 and (
                     state.idle_mode
                     or (not typing_active and idle_elapsed >= settings.MAX_IDLE_TIME)
@@ -486,14 +472,20 @@ def pipeline_main():
                     state.idle_mode = True
                     state.now_event.clear()
                     state.emit("status", "IDLE")
-                    state.emit("log", f"[Idle Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
+                    state.emit("log", f"[Auto Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
                 else:
                     state.now_event.clear()
 
-                # Check if recent Twitch events/messages are available
-                twitch_events = twitch_collector.get_recent_events(
-                    max_size=settings.TWITCH_MAX_CHAT_SIZE,
-                    max_age=settings.TWITCH_MAX_CHAT_AGE,
+                # Twitch chats take priority when enabled; otherwise a random
+                # idle prompt. With neither source available the turn is
+                # skipped silently.
+                twitch_events = (
+                    twitch_collector.get_recent_events(
+                        max_size=settings.TWITCH_MAX_CHAT_SIZE,
+                        max_age=settings.TWITCH_MAX_CHAT_AGE,
+                    )
+                    if state.twitch_enabled
+                    else []
                 )
 
                 if twitch_events:
@@ -503,13 +495,23 @@ def pipeline_main():
                     )
                     state.emit("log", f"[Twitch Idle Event] Responding to {len(twitch_events)} collected Twitch event(s)...")
                     state.emit("transcript", "twitch", prompt_text)
-                else:
+                elif state.idle_enabled:
                     idle_prompts = settings.get_idle_prompts_list()
                     choices = [p for p in idle_prompts if p != state._last_idle_prompt] or idle_prompts
                     prompt_text = random.choice(choices)
                     state._last_idle_prompt = prompt_text
                     state.emit("log", f"[Random Idle Event] Picked prompt: '{prompt_text}'")
                     state.emit("transcript", "idle", prompt_text)
+                else:
+                    # Both sources unavailable (e.g. twitch-only with an empty
+                    # queue) — drop out of idle and wait quietly.
+                    state.idle_mode = False
+                    state.now_event.clear()
+                    state.pipeline_last_activity = time.time()
+                    state.typing_pause_start = None
+                    state.emit("activity")
+                    state.emit("status", "LISTENING")
+                    continue
 
                 process_input(session, prompt_text, messages, generator, speed, memory=memory)
                 state.pipeline_last_activity = time.time()

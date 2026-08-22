@@ -28,7 +28,7 @@ from src.utils.speech import TurnAudioPlayer, classify_barge
 from src.utils.fillers import pick_filler
 from src.utils.audio_queue import AudioGenerationQueue
 from src.utils.llm import parse_stream_chunk, fetch_context_window
-from src.utils.memory import Memory, MemoryWorker, RamMemory
+from src.utils.memory import Mem0Memory, MemoryWorker
 from src.utils.text_chunker import TextChunker
 
 from rich.text import Text
@@ -52,9 +52,9 @@ pause_event = threading.Event()
 now_event = threading.Event()
 # /voice on/off: VAD + voice transcription listening (off by default)
 voice_event = threading.Event()
-# /memory on/off: Qdrant long-term memory on/off (RAM fallback when off); pipeline thread switches
+# /memory on/off: mem0 long-term memory on/off; pipeline thread switches
 memory_request_queue: queue.Queue = queue.Queue()
-memory_status: dict[str, str | bool] = {"enabled": False, "backend": "RAM"}
+memory_status: dict[str, str | bool] = {"enabled": False, "backend": "off"}
 # /new: reset the current chat session (clear LLM history); pipeline thread applies it
 new_chat_event = threading.Event()
 
@@ -642,25 +642,11 @@ def audio_playback_worker(
 
 
 def init_memory(mode: str) -> tuple[MemoryWorker | None, str]:
-    """Build a memory backend. mode='off' -> None (no embedding calls); mode='on' -> Qdrant (RAM fallback). Returns (worker, label)."""
+    """Build a memory backend. mode='off' -> None (no LLM/embedding calls); mode='on' -> mem0 (file-based). Returns (worker, label)."""
     if mode != "on":
         return None, "off"
-    try:
-        if not settings.QDRANT_HOST:
-            raise RuntimeError("QDRANT_HOST not set")
-        backend = Memory(
-            settings.QDRANT_HOST,
-            settings.LM_STUDIO_URL,
-            settings.EMBEDDING_MODEL,
-            collection=settings.QDRANT_COLLECTION,
-        )
-        backend.check()
-        label = f"Qdrant ({settings.QDRANT_HOST})"
-    except Exception as e:
-        log_error(e)
-        backend = RamMemory(settings.LM_STUDIO_URL, settings.EMBEDDING_MODEL)
-        label = f"RAM (Qdrant unavailable: {e})"
-    return MemoryWorker(backend), label
+    backend = Mem0Memory()
+    return MemoryWorker(backend), f"mem0 ({settings.MEM0_DIR})"
 
 
 _last_idle_prompt = ""
@@ -675,7 +661,10 @@ pipeline_last_activity: float = time.time()
 last_typing_activity: float = 0.0
 typing_pause_start: float | None = None
 idle_mode: bool = False
+# Prompt-source toggles: the idle countdown keeps running while either is on;
+# it only stops when both are off.
 idle_enabled: bool = True
+twitch_enabled: bool = True
 _TYPING_PAUSE_SECONDS = 5.0
 
 
@@ -721,7 +710,7 @@ def pipeline_main():
 
         memory, label = init_memory("off")
         memory_status.update(enabled=False, backend=label)
-        emit("log", f"Long-term memory: {label} (use /memory on for Qdrant).")
+        emit("log", f"Long-term memory: {label} (use /memory on for mem0).")
 
         if settings.TWITCH_CLIENT_CHANNEL:
             emit("log", f"Starting Twitch chat collector for channel: {settings.TWITCH_CLIENT_CHANNEL}...")
@@ -901,7 +890,7 @@ def pipeline_main():
 
                 idle_elapsed = _idle_elapsed()
                 if (
-                    idle_enabled
+                    (idle_enabled or twitch_enabled)
                     and (
                         idle_mode
                         or (not typing_active and idle_elapsed >= settings.MAX_IDLE_TIME)
@@ -912,14 +901,20 @@ def pipeline_main():
                         idle_mode = True
                         now_event.clear()
                         emit("status", "IDLE")
-                        emit("log", f"[Idle Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
+                        emit("log", f"[Auto Trigger] No activity for {idle_elapsed:.1f}s (MAX_IDLE_TIME={settings.MAX_IDLE_TIME}s).")
                     else:
                         now_event.clear()
 
-                    # Check if recent Twitch events/messages are available
-                    twitch_events = twitch_collector.get_recent_events(
-                        max_size=settings.TWITCH_MAX_CHAT_SIZE,
-                        max_age=settings.TWITCH_MAX_CHAT_AGE,
+                    # Twitch chats take priority when enabled; otherwise a
+                    # random idle prompt. With neither source available the
+                    # turn is skipped silently.
+                    twitch_events = (
+                        twitch_collector.get_recent_events(
+                            max_size=settings.TWITCH_MAX_CHAT_SIZE,
+                            max_age=settings.TWITCH_MAX_CHAT_AGE,
+                        )
+                        if twitch_enabled
+                        else []
                     )
 
                     if twitch_events:
@@ -929,13 +924,23 @@ def pipeline_main():
                         )
                         emit("log", f"[Twitch Idle Event] Responding to {len(twitch_events)} collected Twitch event(s)...")
                         emit("transcript", "twitch", prompt_text)
-                    else:
+                    elif idle_enabled:
                         idle_prompts = settings.get_idle_prompts_list()
                         choices = [p for p in idle_prompts if p != _last_idle_prompt] or idle_prompts
                         prompt_text = random.choice(choices)
                         _last_idle_prompt = prompt_text
                         emit("log", f"[Random Idle Event] Picked prompt: '{prompt_text}'")
                         emit("transcript", "idle", prompt_text)
+                    else:
+                        # Both sources unavailable (e.g. twitch-only with an
+                        # empty queue) — drop out of idle and wait quietly.
+                        idle_mode = False
+                        now_event.clear()
+                        pipeline_last_activity = time.time()
+                        typing_pause_start = None
+                        emit("activity")
+                        emit("status", "LISTENING")
+                        continue
 
                     _, speech_data = process_input(session, prompt_text, messages, generator, speed, memory=memory,
                                                    asr_model=asr_model,
@@ -1007,13 +1012,14 @@ SLASH_COMMANDS = [
     ("/clear", "Clear the chat display"),
     ("/stop", "Interrupt the current playback / response"),
     ("/now", "Trigger the idle event immediately"),
-    ("/idle", "Enter idle mode now; /idle off disables+resets the countdown, /idle on re-enables it"),
+    ("/idle", "Show idle status; /idle on|off toggles random idle prompts (countdown stops only when Twitch prompts are off too)"),
+    ("/twitch", "Show Twitch prompt status; /twitch on|off toggles using Twitch chats as prompts"),
     ("/pause", "Suspend voice output and the idle countdown"),
     ("/play", "Resume from pause"),
     ("/slap", "Erase queued Twitch messages, or /slap @user for just theirs"),
     ("/config", "Pick the microphone and speaker devices"),
     ("/voice", "Show voice-input status; /voice on|off enables/disables VAD + transcription"),
-    ("/memory", "Show memory status; /memory on|off toggles Qdrant long-term memory (RAM fallback)"),
+    ("/memory", "Show memory status; /memory on|off toggles mem0 long-term memory (file-based)"),
     ("/new", "Start a new chat session (clears LLM history)"),
     ("/help", "Show this list of slash commands"),
 ]
@@ -1471,6 +1477,7 @@ class SpeechTUI(App):
                 "/stop": self._cmd_stop,
                 "/now": self._cmd_now,
                 "/idle": self._cmd_idle,
+                "/twitch": self._cmd_twitch,
                 "/pause": self._cmd_pause,
                 "/play": self._cmd_play,
                 "/slap": self._cmd_slap,
@@ -1507,23 +1514,48 @@ class SpeechTUI(App):
         self._bot_reply("Idle countdown set to zero — I'll start talking now.")
 
     def _cmd_idle(self, arg=""):
-        global idle_enabled, pipeline_last_activity, idle_mode
+        global idle_enabled
         arg = arg.strip().lower()
         if arg == "off":
             idle_enabled = False
-            pipeline_last_activity = time.time()
-            idle_mode = False
-            now_event.clear()
-            emit("status", "LISTENING")
-            self._bot_reply("Idle countdown disabled and reset. Type /idle on to re-enable.")
+            self._bot_reply("Idle prompts disabled. Countdown stops when Twitch prompts are off too.")
         elif arg == "on":
             idle_enabled = True
-            pipeline_last_activity = time.time()
-            now_event.clear()
-            self._bot_reply("Idle countdown enabled.")
+            self._bot_reply("Idle prompts enabled.")
         else:
-            now_event.set()
-            self._bot_reply("Entering idle mode — I'll start talking now.")
+            enabled = "on" if idle_enabled else "off"
+            twitch = "on" if twitch_enabled else "off"
+            if idle_enabled or twitch_enabled:
+                remaining = max(0.0, settings.MAX_IDLE_TIME - _idle_elapsed())
+                countdown = f"{remaining:.1f}s until next idle turn"
+                if idle_mode:
+                    countdown = "in idle mode now"
+            else:
+                countdown = "countdown stopped (both prompt sources off)"
+            self._bot_reply(
+                f"Idle prompts: {enabled} | Twitch prompts: {twitch} | {countdown}. "
+                "Use /idle on|off and /twitch on|off to toggle; /now to trigger a turn now."
+            )
+
+    def _cmd_twitch(self, arg=""):
+        global twitch_enabled
+        arg = arg.strip().lower()
+        if not settings.TWITCH_CLIENT_CHANNEL:
+            self._bot_reply("Twitch is not configured (no TWITCH_CLIENT_CHANNEL set).")
+        elif arg == "off":
+            twitch_enabled = False
+            n = twitch_collector.clear_all()
+            self._bot_reply(f"Twitch prompts disabled; cleared {n} queued chat(s).")
+        elif arg == "on":
+            twitch_enabled = True
+            self._bot_reply(f"Twitch prompts enabled ({settings.TWITCH_CLIENT_CHANNEL}).")
+        else:
+            state_txt = "on" if twitch_enabled else "off"
+            n = len(twitch_collector.snapshot())
+            self._bot_reply(
+                f"Twitch prompts: {state_txt} | {n} queued chat(s) | channel: {settings.TWITCH_CLIENT_CHANNEL}. "
+                "Use /twitch on|off."
+            )
 
     def _cmd_pause(self, arg=""):
         pause_event.set()
@@ -1569,10 +1601,10 @@ class SpeechTUI(App):
         arg = arg.strip().lower()
         if arg == "on":
             if memory_status["enabled"]:
-                self._bot_reply(f"Qdrant long-term memory is already ON ({memory_status['backend']}).")
+                self._bot_reply(f"mem0 long-term memory is already ON ({memory_status['backend']}).")
             else:
                 memory_request_queue.put("on")
-                self._bot_reply("Switching to Qdrant long-term memory...")
+                self._bot_reply("Switching to mem0 long-term memory...")
         elif arg == "off":
             if not memory_status["enabled"]:
                 self._bot_reply("Long-term memory is already OFF.")
@@ -1581,7 +1613,7 @@ class SpeechTUI(App):
                 self._bot_reply("Switching off long-term memory...")
         else:
             if memory_status["enabled"]:
-                self._bot_reply(f"Qdrant long-term memory is ON ({memory_status['backend']}).")
+                self._bot_reply(f"mem0 long-term memory is ON ({memory_status['backend']}).")
             else:
                 self._bot_reply("Long-term memory is OFF.")
 
@@ -1680,7 +1712,7 @@ class SpeechTUI(App):
         try:
             left = f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]"
             if self.status == "LISTENING":
-                if idle_enabled:
+                if idle_enabled or twitch_enabled:
                     remaining = max(0.0, settings.MAX_IDLE_TIME - _idle_elapsed())
                     mid = f"idle [bold]{remaining:5.1f}s[/]"
                 else:
@@ -1701,9 +1733,9 @@ class SpeechTUI(App):
         try:
             self.status_text.update(f"[bold {self._STATUS_COLORS.get(self.status, 'white')}]{self.status}[/]")
             if self.status == "LISTENING":
-                if idle_enabled:
+                if idle_enabled or twitch_enabled:
                     remaining = max(0.0, settings.MAX_IDLE_TIME - _idle_elapsed())
-                    self.idle_count.update(f"idle in [bold]{remaining:5.1f}s[/]")
+                    self.idle_count.update(f"auto in [bold]{remaining:5.1f}s[/]")
                     self.idle_bar.update(progress=remaining, total=settings.MAX_IDLE_TIME)
                 else:
                     self.idle_count.update("idle [bold]off[/]")

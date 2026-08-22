@@ -6,7 +6,7 @@ Real-time local speech-to-speech chatbot: VAD → Whisper → LLM (Ollama/LM Stu
 
 - Setup: `uv sync` (source of truth is `pyproject.toml`; `requirements.txt` is a stale fallback). Copy `.env.template` → `.env` and fill in `HUGGINGFACE_TOKEN`.
 - Run: `uv run speech_to_speech.py` (Textual TUI). **Voice input starts OFF** — VAD/Whisper load on `/voice on`. `t` focuses the text input, Esc unfocuses it. Quit via `System` → `(Q)uit` or `/quit` (both confirm); `q`/`Ctrl+Q` do NOT quit. `hello.py` is the `uv init` scaffold — ignore it.
-- Tests: runnable self-checks in `tests/`, no pytest. `uv run python tests/test_barge_in.py`, `tests/test_barge_command.py`, `tests/test_history_trim.py`, `tests/test_text_history_trim.py`, and `tests/test_text_chunker.py` are plain asserts; `tests/test_idle.py` uses stdlib unittest. Imports are lazy (transformers/torch/qdrant load only on `/voice on` / `/memory on`), so startup and tests are quick.
+- Tests: runnable self-checks in `tests/`, no pytest. `uv run python tests/test_barge_in.py`, `tests/test_barge_command.py`, `tests/test_history_trim.py`, `tests/test_text_history_trim.py`, and `tests/test_text_chunker.py` are plain asserts; `tests/test_idle.py` uses stdlib unittest. Imports are lazy (transformers/torch/mem0 load only on `/voice on` / `/memory on`), so startup and tests are quick.
 - Typecheck: pyrefly (dev dep) is the configured typechecker and the OpenCode LSP (`opencode.json`). No lint tool, no CI.
 
 ## Runtime requirements (not in code)
@@ -32,7 +32,7 @@ Real-time local speech-to-speech chatbot: VAD → Whisper → LLM (Ollama/LM Stu
   - `text_chunker.py` — `TextChunker`, greedy streaming splitter that fills each chunk up to `TARGET_SIZE` words at the furthest natural break
   - `audio_queue.py` — `AudioGenerationQueue`, async TTS playback queue with interruption
   - `generator.py` — `VoiceGenerator` TTS client (Kokoro via PocketTTS or eSpeak fallback)
-  - `memory.py` — Qdrant (`/memory on`) vs in-RAM memory backend, with a worker queue
+  - `memory.py` — file-based mem0 long-term memory (`/memory on`; persists under `data/memory/`) with a worker queue
   - `audio.py` / `audio_io.py` / `audio_utils.py` — lower-level playback/save helpers
   - `twitch_bot.py` — optional Twitch chat integration (no-op without Twitch creds in `.env`)
 - `speech_to_speech.py` holds the TUI, slash-command dispatch, and idle loop (some tests import it directly). `calibrate_barge.py` is the barge calibration harness.

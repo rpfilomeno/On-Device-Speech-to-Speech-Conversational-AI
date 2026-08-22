@@ -28,9 +28,9 @@ shutdown_event = threading.Event()
 interrupt_event = threading.Event()
 pause_event = threading.Event()
 now_event = threading.Event()
-# /memory on/off: Qdrant long-term memory on/off (RAM fallback when off); pipeline thread switches
+# /memory on/off: mem0 long-term memory on/off; pipeline thread switches
 memory_request_queue: queue.Queue = queue.Queue()
-memory_status: dict[str, str | bool] = {"enabled": False, "backend": "RAM"}
+memory_status: dict[str, str | bool] = {"enabled": False, "backend": "off"}
 # /new: reset the current chat session (clear LLM history); pipeline thread applies it
 new_chat_event = threading.Event()
 
@@ -92,6 +92,9 @@ last_typing_activity: float = 0.0
 typing_pause_start: float | None = None
 idle_mode: bool = False
 idle_enabled: bool = True
+# Prompt-source toggles: the idle countdown keeps running while either is on;
+# it only stops when both are off.
+twitch_enabled: bool = True
 _TYPING_PAUSE_SECONDS = 5.0
 
 
