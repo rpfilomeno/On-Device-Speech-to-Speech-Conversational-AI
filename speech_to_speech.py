@@ -25,6 +25,7 @@ from src.utils import (
     twitch_bot_manager,
 )
 from src.utils.speech import TurnAudioPlayer, classify_barge
+from src.utils.fillers import pick_filler
 from src.utils.audio_queue import AudioGenerationQueue
 from src.utils.llm import parse_stream_chunk, fetch_context_window
 from src.utils.memory import Memory, MemoryWorker, RamMemory
@@ -295,6 +296,7 @@ def process_input(
 
     messages.append({"role": "user", "content": user_input})
     emit("status", "THINKING")
+    filler_audio = pick_filler(user_input)
 
     memory_block = None
     if memory is not None:
@@ -337,7 +339,8 @@ def process_input(
         def worker_runner():
             nonlocal interrupted, interrupt_data
             was_int, int_data = audio_playback_worker(
-                audio_queue, whisper_processor, whisper_model, vad_pipeline
+                audio_queue, whisper_processor, whisper_model, vad_pipeline,
+                filler_audio=filler_audio,
             )
             interrupted = was_int
             interrupt_data = int_data
@@ -465,7 +468,8 @@ def process_input(
 
 
 def audio_playback_worker(
-    audio_queue, whisper_processor=None, whisper_model=None, vad_pipeline=None
+    audio_queue, whisper_processor=None, whisper_model=None, vad_pipeline=None,
+    filler_audio: np.ndarray | None = None,
 ) -> tuple[bool, np.ndarray | None]:
     """Manages audio playback in a separate thread, handling interruptions.
 
@@ -477,6 +481,8 @@ def audio_playback_worker(
         whisper_processor: Whisper processor used to gate barge candidates.
         whisper_model: Whisper model used to gate barge candidates.
         vad_pipeline: VAD used to strip non-speech from barge candidates.
+        filler_audio: Pre-synthesized sentiment filler pushed before any
+            synthesized chunk (masks LLM/TTS latency).
 
     Returns:
         tuple[bool, None]: A tuple containing a boolean indicating if the playback was interrupted and the interrupt audio data.
@@ -499,6 +505,10 @@ def audio_playback_worker(
         log_error(e)
         emit("log", f"Error opening audio player: {str(e)}")
         return False, None
+
+    if filler_audio is not None:
+        player.push(filler_audio)
+        emit("log", "[Filler] Played sentiment filler to mask synthesis delay.")
 
     try:
         while True:

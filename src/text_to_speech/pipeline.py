@@ -22,6 +22,7 @@ from src.utils.config import log_error, settings
 from src.utils.llm import parse_stream_chunk, fetch_context_window
 from src.utils.memory import Memory, MemoryWorker, RamMemory
 from src.utils.speech import TurnAudioPlayer
+from src.utils.fillers import pick_filler
 from src.utils.text_chunker import TextChunker
 
 from . import state
@@ -54,6 +55,7 @@ def process_input(
 
     messages.append({"role": "user", "content": user_input})
     state.emit("status", "THINKING")
+    filler_audio = pick_filler(user_input)
 
     memory_block = None
     if memory is not None:
@@ -95,7 +97,7 @@ def process_input(
 
         def worker_runner():
             nonlocal interrupted, interrupt_data
-            was_int, int_data = audio_playback_worker(audio_queue)
+            was_int, int_data = audio_playback_worker(audio_queue, filler_audio=filler_audio)
             interrupted = was_int
             interrupt_data = int_data
 
@@ -221,7 +223,7 @@ def process_input(
         return False, None
 
 
-def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
+def audio_playback_worker(audio_queue, filler_audio: np.ndarray | None = None) -> tuple[bool, np.ndarray | None]:
     """Manages audio playback in a separate thread, handling interruptions.
 
     One TurnAudioPlayer stays open for the whole turn: gapless chunk playback
@@ -229,6 +231,8 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
 
     Args:
         audio_queue (AudioGenerationQueue): The audio queue object.
+        filler_audio: Pre-synthesized sentiment filler pushed before any
+            synthesized chunk (masks LLM/TTS latency).
 
     Returns:
         tuple[bool, None]: A tuple containing a boolean indicating if the playback was interrupted and the interrupt audio data.
@@ -250,6 +254,10 @@ def audio_playback_worker(audio_queue) -> tuple[bool, np.ndarray | None]:
         log_error(e)
         state.emit("log", f"Error opening audio player: {str(e)}")
         return False, None
+
+    if filler_audio is not None:
+        player.push(filler_audio)
+        state.emit("log", "[Filler] Played sentiment filler to mask synthesis delay.")
 
     try:
         while True:
