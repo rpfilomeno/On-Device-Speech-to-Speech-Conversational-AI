@@ -18,28 +18,71 @@ SPEECH_CHECK_THRESHOLD = settings.SPEECH_CHECK_THRESHOLD
 MAX_SILENCE_DURATION = settings.MAX_SILENCE_DURATION
 
 
-def inference_device() -> str:
-    """Pick the best inference device: GPU when available, else CPU."""
-    import torch
+def _abs_model_dir(dir_path: str) -> Path:
+    path = Path(dir_path)
+    return path if path.is_absolute() else settings.BASE_DIR / path
 
+
+def _register_cuda_dlls():
+    """Make the CUDA/cuDNN DLLs bundled with torch (torch/lib) and any NVIDIA
+    pip wheels visible to onnxruntime's CUDA provider. No-op if absent."""
+    import os
+    import sysconfig
+
+    dirs = [Path(sysconfig.get_paths()["purelib"]) / "torch" / "lib"]
+    dirs += sorted((Path(sysconfig.get_paths()["purelib"])).glob("nvidia/*/bin"))
+    for pkg_dir in dirs:
+        try:
+            if pkg_dir.is_dir():
+                os.add_dll_directory(str(pkg_dir))
+                os.environ["PATH"] = str(pkg_dir) + os.pathsep + os.environ.get("PATH", "")
+        except Exception:
+            pass
+
+
+def _onnx_providers() -> list[str] | None:
+    """Preferred ONNX execution providers: CUDA first, CPU always last."""
     try:
-        if torch.cuda.is_available():
-            return "cuda"
+        import onnxruntime as rt
+
+        wanted = [
+            p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
+            if p in rt.get_available_providers()
+        ]
+        return wanted or None
+    except Exception:
+        return None
+
+
+def _offline_safe_load(fn):
+    """Call an onnx-asr loader with HF offline mode temporarily lifted so the
+    first call can download model files into their local dir (config.py pins
+    HF_HUB_OFFLINE=1 globally).
+
+    Patches both the env var and huggingface_hub's cached constant, since the
+    library snapshots the flag at import time.
+    """
+    import os
+
+    saved_env = os.environ.pop("HF_HUB_OFFLINE", None)
+    hf_constants = None
+    saved_flag = None
+    try:
+        from huggingface_hub import constants
+
+        hf_constants = constants
+        saved_flag = constants.HF_HUB_OFFLINE
+        constants.HF_HUB_OFFLINE = False
     except Exception:
         pass
-    return "cpu"
 
-
-def _move_to_device(obj, device=None):
-    """Move a torch module/tensor to the GPU, falling back to CPU on failure."""
-    if device is None:
-        device = inference_device()
-    if device == "cpu":
-        return obj
     try:
-        return obj.to(device)
-    except Exception:
-        return obj.to("cpu")
+        return fn()
+    finally:
+        if saved_env is not None:
+            os.environ["HF_HUB_OFFLINE"] = saved_env
+        if hf_constants is not None and saved_flag is not None:
+            hf_constants.HF_HUB_OFFLINE = saved_flag
 
 
 def _pyaudio_input_index(p, name: str):
@@ -96,164 +139,84 @@ def list_audio_devices() -> tuple[list[str], list[str]]:
     return inputs, outputs
 
 
-def ensure_model_downloaded(repo_id: str, local_dir: str, token: Optional[str] = None) -> Path:
-    """Ensures that a Hugging Face model repository is downloaded into a local directory.
+def init_asr_model():
+    """Initializes the Parakeet TDT ASR model via onnx-asr (int8 ONNX weights).
 
-    If the local directory does not exist or is empty, downloads from HF Hub.
-
-    Args:
-        repo_id (str): Hugging Face repository ID (e.g., 'openai/whisper-base.en').
-        local_dir (str): Local directory path to store model files.
-        token (str, optional): Hugging Face token for gated/private repositories.
-
-    Returns:
-        Path: Path object pointing to the local directory.
+    Downloads to ASR_MODEL_DIR on first use, then loads fully offline. Prefers
+    CUDA; falls back to CPU if the GPU session can't be created (e.g. missing
+    cuDNN DLLs).
     """
-    target_path = Path(local_dir)
-    if not target_path.is_absolute():
-        target_path = settings.BASE_DIR / target_path
+    import onnx_asr
 
-    if not target_path.exists() or not any(target_path.iterdir()):
-        print(f"\nModel files not found at '{target_path}'. Downloading '{repo_id}' from Hugging Face...")
-        target_path.mkdir(parents=True, exist_ok=True)
+    local_dir = _abs_model_dir(settings.ASR_MODEL_DIR)
+    _register_cuda_dlls()
+    providers = _onnx_providers()
+    try:
+        model = _offline_safe_load(lambda: onnx_asr.load_model(
+            settings.ASR_MODEL_NAME, str(local_dir),
+            quantization="int8", providers=providers,
+        ))
+    except Exception as e:
+        log_error(e)
+        print(f"GPU ASR load failed ({e}); retrying on CPU...")
+        model = _offline_safe_load(lambda: onnx_asr.load_model(
+            settings.ASR_MODEL_NAME, str(local_dir),
+            quantization="int8", providers=["CPUExecutionProvider"],
+        ))
+        providers = ["CPUExecutionProvider"]
 
-        from huggingface_hub import snapshot_download
-
-        orig_hf_offline = os.environ.get("HF_HUB_OFFLINE")
-        orig_tf_offline = os.environ.get("TRANSFORMERS_OFFLINE")
-        os.environ.pop("HF_HUB_OFFLINE", None)
-        os.environ.pop("TRANSFORMERS_OFFLINE", None)
-
-        try:
-            download_kwargs = {
-                "repo_id": repo_id,
-                "local_dir": str(target_path),
-            }
-            if token:
-                download_kwargs["token"] = token
-
-            snapshot_download(**download_kwargs)
-            print(f"Successfully downloaded '{repo_id}' to '{target_path}'.")
-        finally:
-            if orig_hf_offline is not None:
-                os.environ["HF_HUB_OFFLINE"] = orig_hf_offline
-            if orig_tf_offline is not None:
-                os.environ["TRANSFORMERS_OFFLINE"] = orig_tf_offline
-
-    return target_path
+    device = "GPU" if providers and providers[0] == "CUDAExecutionProvider" else "CPU"
+    print(f"ASR ready: {settings.ASR_MODEL_NAME} int8 ({device})")
+    return model
 
 
-def init_whisper_model(
-    model_id: Optional[str] = None,
-    model_dir: Optional[str] = None,
-    hf_token: Optional[str] = None,
-):
-    """Initializes the Whisper processor and model, downloading to local_dir first if missing.
+def init_vad_pipeline():
+    """Initializes Silero VAD via onnx-asr.
 
-    Args:
-        model_id (str, optional): Hugging Face repo ID. Defaults to settings.WHISPER_MODEL_ID.
-        model_dir (str, optional): Local target directory. Defaults to settings.WHISPER_MODEL_DIR.
-        hf_token (str, optional): Hugging Face API token.
-
-    Returns:
-        tuple: (WhisperProcessor, WhisperForConditionalGeneration)
+    Downloads to VAD_MODEL_DIR on first use, then loads fully offline.
     """
-    from transformers import WhisperProcessor, WhisperForConditionalGeneration
+    import onnx_asr
 
-    if model_id is None:
-        model_id = settings.WHISPER_MODEL_ID
-    if model_dir is None:
-        model_dir = settings.WHISPER_MODEL_DIR
-
-    local_path = ensure_model_downloaded(model_id, model_dir, token=hf_token)
-
-    whisper_processor = WhisperProcessor.from_pretrained(
-        str(local_path), local_files_only=True
+    vad_dir = _abs_model_dir(settings.VAD_MODEL_DIR)
+    _register_cuda_dlls()
+    pipeline = _offline_safe_load(
+        lambda: onnx_asr.load_vad("silero", str(vad_dir))
     )
-    whisper_model = WhisperForConditionalGeneration.from_pretrained(
-        str(local_path), local_files_only=True
-    )
-    whisper_model = _move_to_device(whisper_model)
-
-    return whisper_processor, whisper_model
-
-
-def init_vad_pipeline(hf_token):
-    """Initializes the Voice Activity Detection pipeline.
-
-    Args:
-        hf_token (str): Hugging Face API token.
-
-    Returns:
-        pyannote.audio.pipelines.VoiceActivityDetection: VAD pipeline.
-    """
-    from pyannote.audio import Model
-    from pyannote.audio.pipelines import VoiceActivityDetection
-
-    vad_dir = ensure_model_downloaded(
-        repo_id=settings.VAD_MODEL_ID,
-        local_dir=settings.VAD_MODEL_DIR,
-        token=hf_token,
-    )
-
-    model = Model.from_pretrained(
-        str(vad_dir), token=hf_token, local_files_only=True
-    )
-    assert model is not None
-    model = _move_to_device(model)
-
-    pipeline = VoiceActivityDetection(segmentation=model)
-
-    HYPER_PARAMETERS = {
-        "min_duration_on": settings.VAD_MIN_DURATION_ON,
-        "min_duration_off": settings.VAD_MIN_DURATION_OFF,
-    }
-    pipeline.instantiate(HYPER_PARAMETERS)
-
+    print("VAD ready: silero (onnx-asr)")
     return pipeline
 
 
 def detect_speech_segments(pipeline, audio_data, sample_rate=None):
-    """Detects speech segments in audio using pyannote VAD.
+    """Detects speech segments using Silero VAD.
 
     Args:
-        pipeline (pyannote.audio.pipelines.VoiceActivityDetection): VAD pipeline.
-        audio_data (np.ndarray or torch.Tensor): Audio data.
+        pipeline: VAD pipeline from init_vad_pipeline().
+        audio_data (np.ndarray): Mono float32 audio.
         sample_rate (int, optional): Sample rate of the audio. Defaults to settings.RATE.
 
     Returns:
-        torch.Tensor or None: Concatenated speech segments as a torch tensor, or None if no speech is detected.
+        np.ndarray or None: Concatenated speech segments as float32 audio, or None if no speech is detected.
     """
     if sample_rate is None:
         sample_rate = settings.RATE
+    if audio_data is None:
+        return None
 
-    if len(audio_data.shape) == 1:
-        audio_data = audio_data.reshape(1, -1)
+    audio = np.asarray(audio_data, dtype=np.float32).reshape(-1)
+    if audio.size < sample_rate // 10:
+        return None
 
-    import torch
-    from torch.nn.functional import pad
+    segments = next(pipeline.segment_batch(
+        audio[None, :],
+        np.array([audio.size], dtype=np.int64),
+        sample_rate,
+        min_speech_duration_ms=settings.VAD_MIN_DURATION_ON * 1000,
+        min_silence_duration_ms=settings.VAD_MIN_DURATION_OFF * 1000,
+    ))
 
-    if not isinstance(audio_data, torch.Tensor):
-        audio_data = torch.from_numpy(audio_data)
-    audio_data = _move_to_device(audio_data)
-
-    if audio_data.shape[1] < sample_rate:
-        padding_size = sample_rate - audio_data.shape[1]
-        audio_data = pad(audio_data, (0, padding_size))
-
-    vad = pipeline({"waveform": audio_data, "sample_rate": sample_rate})
-
-    speech_segments = []
-    for speech in vad.get_timeline().support():
-        start_sample = int(speech.start * sample_rate)
-        end_sample = int(speech.end * sample_rate)
-        if start_sample < audio_data.shape[1]:
-            end_sample = min(end_sample, audio_data.shape[1])
-            segment = audio_data[0, start_sample:end_sample]
-            speech_segments.append(segment)
-
-    if speech_segments:
-        return torch.cat(speech_segments)
+    parts = [audio[start:end] for start, end in segments]
+    if parts:
+        return np.concatenate(parts)
     return None
 
 
@@ -317,7 +280,7 @@ def record_continuous_audio(max_wait=None):
     buffer_frames = []
     buffer_size = int(RATE * 0.5 / CHUNK)
     silence_frames = 0
-    max_silence_frames = int(RATE / CHUNK * 1)
+    max_silence_frames = int(RATE * settings.END_SILENCE_SECONDS / CHUNK)
     recording = False
     start_time = time.time()
 
@@ -635,13 +598,12 @@ class TurnAudioPlayer:
         self._out = self._in = None
 
 
-def transcribe_audio(processor, model, audio_data, sampling_rate=None):
-    """Transcribes audio using Whisper.
+def transcribe_audio(model, audio_data, sampling_rate=None):
+    """Transcribes audio using the onnx-asr model from init_asr_model().
 
     Args:
-        processor (transformers.WhisperProcessor): Whisper processor.
-        model (transformers.WhisperForConditionalGeneration): Whisper model.
-        audio_data (np.ndarray or torch.Tensor): Audio data to transcribe.
+        model: ASR model (onnx-asr).
+        audio_data (np.ndarray): Mono float32/int16-range audio to transcribe.
         sampling_rate (int, optional): Sample rate of the audio. Defaults to settings.RATE.
 
     Returns:
@@ -650,18 +612,11 @@ def transcribe_audio(processor, model, audio_data, sampling_rate=None):
     if sampling_rate is None:
         sampling_rate = settings.RATE
 
-    if audio_data is None:
+    if model is None or audio_data is None:
         return ""
 
-    import torch
+    audio = np.asarray(audio_data, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return ""
 
-    if isinstance(audio_data, torch.Tensor):
-        audio_data = audio_data.cpu().numpy()
-
-    input_features = processor(
-        audio_data, sampling_rate=sampling_rate, return_tensors="pt"
-    ).input_features
-    input_features = input_features.to(model.device)
-    predicted_ids = model.generate(input_features)
-    transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
-    return transcription[0]
+    return model.recognize(audio, sample_rate=sampling_rate)

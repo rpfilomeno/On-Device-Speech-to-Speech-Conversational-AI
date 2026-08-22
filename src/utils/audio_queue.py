@@ -143,23 +143,19 @@ class AudioGenerationQueue:
 
                     if getattr(self.generator, "streaming", False):
                         produced = False
-                        buffer = []
+                        first = True
                         for seg in self.generator.generate(
                             sentence, speed=self.speed, stream=True
                         ):
                             if seg is None or len(seg) == 0:
                                 continue
                             produced = True
-                            buffer.append(seg)
+                            # Enqueue each segment as it arrives so playback can
+                            # start before the sentence finishes synthesizing.
+                            self.audio_queue.put((seg, sentence, first))
+                            first = False
                         if not produced:
                             raise ValueError("Generated audio data is empty")
-                        # One segment per sentence: splitting it into smaller pieces
-                        # would make playback reopen the audio device per piece,
-                        # which sounds choppy. The server buffers the WAV anyway,
-                        # so buffering here costs no latency.
-                        self.audio_queue.put(
-                            (np.concatenate(buffer), sentence, True)
-                        )
                     else:
                         audio_data, _ = self.generator.generate(
                             sentence, speed=self.speed

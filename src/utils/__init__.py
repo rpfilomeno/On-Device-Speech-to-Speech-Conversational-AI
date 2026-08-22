@@ -5,7 +5,7 @@ from .audio_utils import save_audio_file, generate_and_play_sentences
 from .speech import (
     init_vad_pipeline, detect_speech_segments, record_audio,
     record_continuous_audio, check_for_speech, TurnAudioPlayer,
-    transcribe_audio, init_whisper_model, ensure_model_downloaded,
+    transcribe_audio, init_asr_model,
     list_audio_devices,
 )
 from .config import settings
@@ -26,8 +26,7 @@ __all__ = [
     'check_for_speech',
     'TurnAudioPlayer',
     'transcribe_audio',
-    'init_whisper_model',
-    'ensure_model_downloaded',
+    'init_asr_model',
     'list_audio_devices',
     'settings',
     'TextChunker',

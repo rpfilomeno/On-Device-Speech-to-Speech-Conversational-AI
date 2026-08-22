@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "numpy>=2.5.1",
-  "pyannote-audio>=4.0.7",
+  "onnx-asr[hub]>=0.12.0",
+  "onnxruntime-gpu==1.22.0",
   "pyaudio>=0.2.14",
   "pydantic>=2.13.4",
   "pydantic-settings>=2.15.0",
@@ -19,8 +20,6 @@ dependencies = [
   "soundfile>=0.14.0",
   "textual>=8.2.8",
   "torch>=2.13.0",
-  "torch-audiomentations>=0.12.0",
-  "transformers>=5.14.1",
   "twitch-python>=0.0.20",
   "vadersentiment>=3.3.2",
 ]

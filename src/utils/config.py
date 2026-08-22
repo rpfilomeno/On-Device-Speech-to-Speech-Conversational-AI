@@ -27,7 +27,6 @@ class Settings(BaseSettings):
     CF_ACCESS_CLIENT_SECRET: Optional[str] = Field(default="")
     SPEED: float = Field(default=1.0)
     TTS_MAX_RETRIES: int = Field(default=3)
-    HUGGINGFACE_TOKEN: Optional[str] = Field(default="")
 
     LM_STUDIO_URL: str = Field(...)
     DEFAULT_SYSTEM_PROMPT: str = Field(...)
@@ -41,16 +40,20 @@ class Settings(BaseSettings):
     # model always has headroom left to generate a full response.
     CONTEXT_TRIM_RATIO: float = Field(default=0.8)
     LLM_TEMPERATURE: float = Field(default=0.7)
+    # Max seconds to wait for memory recall before sending the LLM request;
+    # later results are applied to the next turn instead.
+    MEMORY_RECALL_GRACE: float = Field(default=0.2)
 
     QDRANT_HOST: Optional[str] = Field(default="")
     QDRANT_COLLECTION: str = Field(default="conversation_memory")
     EMBEDDING_MODEL: str = Field(default="text-embedding-nomic-embed-text-v1.5")
 
-    WHISPER_MODEL_ID: str = Field(default="openai/whisper-tiny.en")
-    WHISPER_MODEL_DIR: str = Field(default="data/models/whisper-tiny.en")
+    # ASR (NVIDIA Parakeet TDT via onnx-asr; int8 ONNX weights)
+    ASR_MODEL_NAME: str = Field(default="nemo-parakeet-tdt-0.6b-v2")
+    ASR_MODEL_DIR: str = Field(default="data/models/parakeet-tdt-0.6b-v2")
 
-    VAD_MODEL_ID: str = Field(default="pyannote/segmentation-3.0")
-    VAD_MODEL_DIR: str = Field(default="data/models/segmentation-3.0")
+    # VAD (Silero via onnx-asr)
+    VAD_MODEL_DIR: str = Field(default="data/models/silero-vad")
     VAD_MIN_DURATION_ON: float = Field(default=0.1)
     VAD_MIN_DURATION_OFF: float = Field(default=0.1)
 
@@ -62,6 +65,7 @@ class Settings(BaseSettings):
     SILENCE_THRESHOLD: float = Field(default=0.01)
     INTERRUPTION_THRESHOLD: float = Field(default=0.005)
     MAX_SILENCE_DURATION: int = Field(default=1)
+    END_SILENCE_SECONDS: float = Field(default=0.5)
     SPEECH_CHECK_TIMEOUT: float = Field(default=0.1)
     SPEECH_CHECK_THRESHOLD: float = Field(default=0.005)
     BARGE_IN_NOISE_MARGIN: float = Field(default=3.0)
@@ -182,10 +186,6 @@ def configure_logging():
     logging.getLogger("PIL").setLevel(logging.ERROR)
     logging.getLogger("matplotlib").setLevel(logging.ERROR)
     logging.getLogger("torch").setLevel(logging.ERROR)
-    logging.getLogger("tensorflow").setLevel(logging.ERROR)
-    logging.getLogger("whisper").setLevel(logging.ERROR)
-    logging.getLogger("transformers").setLevel(logging.ERROR)
-    logging.getLogger("pyannote").setLevel(logging.ERROR)
     logging.getLogger("sounddevice").setLevel(logging.ERROR)
     logging.getLogger("soundfile").setLevel(logging.ERROR)
     logging.getLogger("uvicorn").setLevel(logging.ERROR)

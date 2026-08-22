@@ -9,7 +9,7 @@ Usage:
   uv run calibrate_barge.py --speak                # SPEAK a barge word during playback (true-barge check)
   uv run calibrate_barge.py --count 5              # repeat N times, report x/N barges
   uv run calibrate_barge.py --timeout 0.3 --margin 4.0 --threshold 0.03
-  uv run calibrate_barge.py --mic-test             # record your voice + transcribe (Whisper sanity)
+  uv run calibrate_barge.py --mic-test             # record your voice + transcribe (ASR sanity)
   uv run calibrate_barge.py --transcribe           # transcribe captured barge speech on barge
 """
 import argparse
@@ -24,7 +24,7 @@ from src.utils.generator import VoiceGenerator
 from src.utils.speech import (
     TurnAudioPlayer,
     _sd_device_index,
-    init_whisper_model,
+    init_asr_model,
     record_audio,
     transcribe_audio,
 )
@@ -91,9 +91,8 @@ def run_barge_test(gen, speak: bool, tail: float):
         player.stop()
 
 
-def transcribe(proc, model, audio, rate):
-    text = transcribe_audio(proc, model, audio, sampling_rate=rate)
-    return text
+def transcribe(model, audio, rate):
+    return transcribe_audio(model, audio, sampling_rate=rate)
 
 
 def levels_test(duration: float):
@@ -176,14 +175,10 @@ def main():
         echo_test(get_generator(), args.echo)
         return
 
-    proc = model = None
+    model = None
     if args.mic_test or args.transcribe:
-        print("\nLoading Whisper (one-time, slow on CPU)...")
-        proc, model = init_whisper_model(
-            settings.WHISPER_MODEL_ID,
-            settings.WHISPER_MODEL_DIR,
-            hf_token=settings.HUGGINGFACE_TOKEN,
-        )
+        print("\nLoading ASR model (one-time download on first run)...")
+        model = init_asr_model()
 
     if args.mic_test:
         print("\n[mic-test] Speak a clear sentence into the mic during the whole recording window:")
@@ -202,8 +197,8 @@ def main():
         out.parent.mkdir(exist_ok=True)
         sf.write(out, audio, settings.RATE)
         print(f"[mic-test] saved to {out}")
-        text = transcribe(proc, model, audio, settings.RATE)
-        print(f"[mic-test] Whisper heard: {text!r}")
+        text = transcribe(model, audio, settings.RATE)
+        print(f"[mic-test] ASR heard: {text!r}")
         return
 
     gen = get_generator()
@@ -214,8 +209,8 @@ def main():
         if barged is None:
             sys.exit(1)
         n_barged += int(barged)
-        if barged and capture is not None and proc is not None:
-            text = transcribe(proc, model, capture, settings.RATE)
+        if barged and capture is not None and model is not None:
+            text = transcribe(model, capture, settings.RATE)
             print(f"  captured speech: {text!r}")
         elif barged and capture is None:
             print("  (no capture)")

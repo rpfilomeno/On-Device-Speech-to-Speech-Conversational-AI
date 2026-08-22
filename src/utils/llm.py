@@ -106,7 +106,8 @@ def get_ai_response(
         def streaming_iterator():
             """Iterates over the streaming response."""
             try:
-                for line in response.iter_lines():
+                # chunk_size=1 keeps SSE tokens unbuffered — lower time-to-first-token.
+                for line in response.iter_lines(chunk_size=1):
                     if line:
                         yield line
                     else:
